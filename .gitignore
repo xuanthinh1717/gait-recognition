@@ -1,0 +1,9 @@
+data/
+outputs/
+logs/
+__pycache__/
+*.pth
+*.pyc
+venv/
+.agents/
+notebooks/
