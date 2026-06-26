@@ -28,6 +28,13 @@ if torch.cuda.is_available():
     torch.cuda.manual_seed_all(SEED)
 
 # =====================================================
+# DEVICE
+# =====================================================
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Using device:", device)
+
+# =====================================================
 # DATASET
 # =====================================================
 
@@ -37,8 +44,10 @@ train_dataset = GaitDataset(
 
 train_loader = DataLoader(
     train_dataset,
-    batch_size=16,
-    shuffle=True
+    batch_size=128,
+    shuffle=True,
+    num_workers=4,
+    pin_memory=True
 )
 
 val_dataset = GaitDataset(
@@ -47,8 +56,10 @@ val_dataset = GaitDataset(
 
 val_loader = DataLoader(
     val_dataset,
-    batch_size=16,
-    shuffle=False
+    batch_size=128,
+    shuffle=False,
+    num_workers=4,
+    pin_memory=True
 )
 
 # =====================================================
@@ -59,12 +70,14 @@ val_loader = DataLoader(
 
 # Attention + BatchNorm
 # lr=0.0001
-num_classes = 10304
+num_classes = 10307
 
 model = CNN(
     num_classes=num_classes,
-    dropout=0.3
-)
+    dropout=0.1
+).to(device)
+
+model = torch.nn.DataParallel(model)
 
 # =====================================================
 # LOSS + OPTIMIZER
@@ -74,7 +87,7 @@ criterion = nn.CrossEntropyLoss()
 
 optimizer = optim.Adam(
     model.parameters(),
-    lr=0.0001
+    lr=0.001
 )
 
 # =====================================================
@@ -124,6 +137,8 @@ for epoch in range(epochs):
 
         optimizer.zero_grad()
 
+        images, labels = images.to(device), labels.to(device)
+
         outputs = model(images)
 
         loss = criterion(
@@ -167,6 +182,8 @@ for epoch in range(epochs):
     with torch.no_grad():
 
         for images, labels in val_loader:
+
+            images, labels = images.to(device), labels.to(device)
 
             outputs = model(images)
 
