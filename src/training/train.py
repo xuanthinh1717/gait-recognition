@@ -59,7 +59,7 @@ val_loader = DataLoader(
 
 # Attention + BatchNorm
 # lr=0.0001
-num_classes = 124
+num_classes = 10304
 
 model = CNN(
     num_classes=num_classes,

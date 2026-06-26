@@ -6,7 +6,7 @@ import pandas as pd
 # CONFIG
 # =====================================================
 
-GEI_ROOT = r"data/processed/gei"
+GEI_ROOT = r"data/processed/gei_oumvlp"
 
 OUTPUT_DIR = r"data/splits"
 
