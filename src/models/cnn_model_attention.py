@@ -95,20 +95,24 @@ class CNN(nn.Module):
         )
 
         if num_conv_blocks == 2:
-            self.cbam2 = CBAMBlock(32)
+            # Fix 1: reduction=4 thay vì 16 → tránh bottleneck 2 neurons
+            self.cbam2 = CBAMBlock(32, reduction=4)
             self.block3 = None
             self.cbam3 = None
-            fc_in = 32 * 16 * 16
+            fc_in = 32 * 16 * 16  # 8192
+
         else:
             self.cbam2 = None
             self.block3 = nn.Sequential(
                 nn.Conv2d(32, 64, kernel_size=3, padding=1),
-                nn.ReLU(inplace=True)
+                nn.ReLU(inplace=True),
+                nn.MaxPool2d(2)         # Fix 2: thêm MaxPool → spatial 8x8
             )
-            self.cbam3 = CBAMBlock(64)
-            fc_in = 64 * 16 * 16
+            # Fix 1: reduction=4 thay vì 16 → tránh bottleneck 4 neurons
+            self.cbam3 = CBAMBlock(64, reduction=4)
+            fc_in = 64 * 8 * 8         # Fix 2: 4096 thay vì 16384
 
-        # --- Classifier ---
+        # Fix 3: thêm layer trung gian để scale FC với 10307 classes
         layers = [
             nn.Flatten(),
             nn.Linear(fc_in, 4096),
