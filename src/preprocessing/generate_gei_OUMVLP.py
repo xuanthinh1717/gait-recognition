@@ -5,9 +5,7 @@ import cv2
 # PATHS
 # =====================================================
 
-# Kaggle: dataset được mount tại /kaggle/input/<tên-dataset>/
-# Đổi "oumvlp-gei" thành tên dataset bạn đặt khi upload lên Kaggle
-INPUT_ROOT = "/kaggle/input/oumvlp-gei/GEI"
+INPUT_ROOT = "/kaggle/input/datasets/shizunyan/oumvlp-gei/GEI"
 
 OUTPUT_ROOT = "data/processed/gei_oumvlp"
 
@@ -24,13 +22,10 @@ gei_count = 0
 
 for folder in sorted(os.listdir(INPUT_ROOT)):
 
-    # folder = "000-00", "000-01", "015-00", ...
     folder_path = os.path.join(INPUT_ROOT, folder)
 
     if not os.path.isdir(folder_path):
         continue
-
-    print(f"\nFolder: {folder}")
 
     folder_count += 1
 
@@ -38,10 +33,6 @@ for folder in sorted(os.listdir(INPUT_ROOT)):
 
         if not file_name.endswith(".png"):
             continue
-
-        # -----------------------------------------
-        # READ
-        # -----------------------------------------
 
         file_path = os.path.join(folder_path, file_name)
 
@@ -51,6 +42,14 @@ for folder in sorted(os.listdir(INPUT_ROOT)):
             continue
 
         # -----------------------------------------
+        # PAD THÀNH VUÔNG TRƯỚC
+        # -----------------------------------------
+
+        h, w = img.shape
+        pad = (h - w) // 2
+        img = cv2.copyMakeBorder(img, 0, 0, pad, pad, cv2.BORDER_CONSTANT, value=0)
+
+        # -----------------------------------------
         # RESIZE
         # -----------------------------------------
 
@@ -58,36 +57,24 @@ for folder in sorted(os.listdir(INPUT_ROOT)):
 
         # -----------------------------------------
         # OUTPUT PATH
-        # OU-MVLP không có folder per subject
-        # → giữ nguyên cấu trúc: subject_id/angle-trial.png
-        # để create_split xử lý giống CASIA-B
         # -----------------------------------------
 
-        subject_id = os.path.splitext(file_name)[0]  # "00001"
+        subject_id = os.path.splitext(file_name)[0]
 
         save_dir = os.path.join(OUTPUT_ROOT, subject_id)
 
         os.makedirs(save_dir, exist_ok=True)
 
-        save_name = f"{folder}.png"  # "000-00.png"
-
-        save_path = os.path.join(save_dir, save_name)
-
-        # -----------------------------------------
-        # SAVE
-        # -----------------------------------------
+        save_path = os.path.join(save_dir, f"{folder}.png")
 
         cv2.imwrite(save_path, img)
 
         gei_count += 1
 
-        print(f"Saved: {save_path}")
-
 # =====================================================
 # DONE
 # =====================================================
 
-print("\n==========================")
 print("Done")
 print("Folders processed:", folder_count)
 print("GEIs saved:", gei_count)
