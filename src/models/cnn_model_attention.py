@@ -10,8 +10,6 @@ class ChannelAttention(nn.Module):
         self.avg_pool = nn.AdaptiveAvgPool2d(1)
         self.max_pool = nn.AdaptiveMaxPool2d(1)
 
-        # Tách MLP riêng, không dùng Flatten trong Sequential
-        # để tránh shape conflict khi share weights giữa avg và max
         self.mlp = nn.Sequential(
             nn.Linear(in_channels, in_channels // reduction, bias=False),
             nn.ReLU(inplace=True),
@@ -23,11 +21,9 @@ class ChannelAttention(nn.Module):
     def forward(self, x):
         b, c, _, _ = x.shape
 
-        # Flatten thủ công trước khi đưa vào MLP
         avg_out = self.mlp(self.avg_pool(x).view(b, c))
         max_out = self.mlp(self.max_pool(x).view(b, c))
 
-        # Kết hợp avg + max rồi scale lại feature map gốc
         scale = self.sigmoid(avg_out + max_out)
         scale = scale.view(b, c, 1, 1)
 
@@ -40,7 +36,7 @@ class SpatialAttention(nn.Module):
         super().__init__()
 
         self.conv = nn.Conv2d(
-            in_channels=2,       # avg + max theo channel dimension
+            in_channels=2,
             out_channels=1,
             kernel_size=kernel_size,
             padding=kernel_size // 2,
@@ -49,12 +45,11 @@ class SpatialAttention(nn.Module):
         self.sigmoid = nn.Sigmoid()
 
     def forward(self, x):
-        # Pool theo channel axis để lấy spatial context
-        avg_out = torch.mean(x, dim=1, keepdim=True)   # (B, 1, H, W)
-        max_out, _ = torch.max(x, dim=1, keepdim=True)  # (B, 1, H, W)
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
 
-        concat = torch.cat([avg_out, max_out], dim=1)   # (B, 2, H, W)
-        scale = self.sigmoid(self.conv(concat))          # (B, 1, H, W)
+        concat = torch.cat([avg_out, max_out], dim=1)
+        scale = self.sigmoid(self.conv(concat))
 
         return x * scale
 
@@ -68,10 +63,9 @@ class CBAMBlock(nn.Module):
         self.spatial_attention = SpatialAttention(spatial_kernel)
 
     def forward(self, x):
-        residual = x
         x = self.channel_attention(x)
         x = self.spatial_attention(x)
-        return x + residual
+        return x
 
 
 class CNN(nn.Module):
@@ -80,7 +74,7 @@ class CNN(nn.Module):
         self,
         num_classes,
         num_conv_blocks=3,
-        dropout=0.3
+        dropout=0.1
     ):
         super().__init__()
 
@@ -89,15 +83,13 @@ class CNN(nn.Module):
         # --- Block 1 ---
         self.block1 = nn.Sequential(
             nn.Conv2d(1, 16, kernel_size=3, padding=1),
-            nn.BatchNorm2d(16),
             nn.ReLU(inplace=True),
             nn.MaxPool2d(2)
         )
 
-        # --- Block 2 + CBAM (luôn có) ---
+        # --- Block 2 ---
         self.block2 = nn.Sequential(
             nn.Conv2d(16, 32, kernel_size=3, padding=1),
-            nn.BatchNorm2d(32),
             nn.ReLU(inplace=True),
             nn.MaxPool2d(2)
         )
@@ -111,9 +103,7 @@ class CNN(nn.Module):
             self.cbam2 = None
             self.block3 = nn.Sequential(
                 nn.Conv2d(32, 64, kernel_size=3, padding=1),
-                nn.BatchNorm2d(64),
                 nn.ReLU(inplace=True)
-                # Không MaxPool để giữ spatial resolution cho spatial attention
             )
             self.cbam3 = CBAMBlock(64)
             fc_in = 64 * 16 * 16
@@ -121,14 +111,14 @@ class CNN(nn.Module):
         # --- Classifier ---
         layers = [
             nn.Flatten(),
-            nn.Linear(fc_in, 512),
+            nn.Linear(fc_in, 2048),
             nn.ReLU(inplace=True)
         ]
 
         if dropout > 0:
             layers.append(nn.Dropout(dropout))
 
-        layers.append(nn.Linear(512, num_classes))
+        layers.append(nn.Linear(2048, num_classes))
 
         self.classifier = nn.Sequential(*layers)
 
