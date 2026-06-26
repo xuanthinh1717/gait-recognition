@@ -23,7 +23,11 @@ test_loader = DataLoader(
 # MODEL
 # =====================================================
 
-model = CNN(num_classes=124)
+model = CNN(
+    num_classes=10307,
+    num_conv_blocks=2,
+    dropout=0.1
+)
 
 model.load_state_dict(
     torch.load("outputs/model.pth")

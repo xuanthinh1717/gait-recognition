@@ -111,8 +111,11 @@ class CNN(nn.Module):
         # --- Classifier ---
         layers = [
             nn.Flatten(),
-            nn.Linear(fc_in, 2048),
-            nn.ReLU(inplace=True)
+            nn.Linear(fc_in, 4096),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(4096, 2048),
+            nn.ReLU(inplace=True),
         ]
 
         if dropout > 0:

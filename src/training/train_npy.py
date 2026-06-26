@@ -75,6 +75,7 @@ num_classes = 10307
 
 model = CNN(
     num_classes=num_classes,
+    num_conv_blocks=2,
     dropout=0.1
 ).to(device)
 
@@ -88,7 +89,7 @@ criterion = nn.CrossEntropyLoss()
 
 optimizer = optim.Adam(
     model.parameters(),
-    lr=0.001
+    lr=0.0001
 )
 
 # =====================================================
