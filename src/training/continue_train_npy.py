@@ -77,7 +77,7 @@ model = CNN(
 model = torch.nn.DataParallel(model)
 
 # =====================================================
-# [THÊM] RESUME FROM CHECKPOINT
+# RESUME FROM CHECKPOINT
 # =====================================================
 
 RESUME_PATH = "/kaggle/input/gait-checkpoint/model.pth"  # ← đổi tên dataset cho đúng
@@ -96,10 +96,10 @@ criterion = nn.CrossEntropyLoss()
 
 optimizer = optim.Adam(
     model.parameters(),
-    lr=0.0005  # ← [THÊM] giảm lr xuống một nửa vì đang train tiếp
+    lr=0.0001
 )
 
-# [THÊM] Learning rate scheduler
+# Learning rate scheduler
 scheduler = optim.lr_scheduler.ReduceLROnPlateau(
     optimizer,
     mode='max',
@@ -122,7 +122,7 @@ os.makedirs("outputs", exist_ok=True)
 
 log_file = "logs/training_log.csv"
 model_file = "outputs/model.pth"
-best_val_accuracy = 77.74  # ← [THÊM] set bằng val acc tốt nhất lần trước để không save lại model tệ hơn
+best_val_accuracy = 0
 save_start_epoch = 0       # ← [THÊM] đổi thành 0 vì epoch nào cũng có thể là best
 
 with open(log_file, mode="w", newline="") as f:
@@ -197,7 +197,7 @@ for epoch in range(epochs):
     val_avg_loss = val_running_loss / len(val_loader)
     val_accuracy = 100 * val_correct / val_total
 
-    # [THÊM] scheduler step
+    # scheduler step
     scheduler.step(val_accuracy)
 
     print(
@@ -206,7 +206,6 @@ for epoch in range(epochs):
         f"Train Accuracy: {accuracy:.2f}% "
         f"Val Loss: {val_avg_loss:.4f} "
         f"Val Accuracy: {val_accuracy:.2f}% "
-        f"LR: {optimizer.param_groups[0]['lr']:.6f}"  # ← [THÊM] in lr để theo dõi
     )
 
     if epoch >= save_start_epoch and val_accuracy > best_val_accuracy:
