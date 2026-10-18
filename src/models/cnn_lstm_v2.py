@@ -39,10 +39,22 @@ class FrameEncoder(nn.Module):
 
 
 class CNNLSTM(nn.Module):
-    def __init__(self, num_classes, temporal="lstm", feat_dim=256, dropout=0.3):
+    """
+    temporal="lstm": CNN tung frame -> LSTM -> gop theo thoi gian
+    temporal="mean": CNN tung frame -> gop theo thoi gian (khong LSTM)
+    pool: cach gop thoi gian khi lay embedding / logits
+        "mean": trung binh dau ra qua cac buoc (mac dinh, hanh vi cu)
+        "last": chi lay buoc cuoi (chi co nghia voi LSTM)
+    """
+
+    def __init__(self, num_classes, temporal="lstm", feat_dim=256, dropout=0.3, pool="mean"):
         super().__init__()
         assert temporal in ("lstm", "mean")
+        assert pool in ("mean", "last")
+        if pool == "last" and temporal != "lstm":
+            raise ValueError("pool='last' chi dung cho temporal='lstm'")
         self.temporal = temporal
+        self.pool = pool
         self.encoder = FrameEncoder(feat_dim)
         if temporal == "lstm":
             # hidden = feat_dim de B va E co cung so chieu embedding (256)
@@ -50,15 +62,22 @@ class CNNLSTM(nn.Module):
         self.drop = nn.Dropout(dropout)
         self.head = nn.Linear(feat_dim, num_classes)
 
-    def embed(self, x):                          # x: (B, T, 1, S, S)
+    def step_features(self, x):                  # x: (B, T, 1, S, S) -> (B, T, feat_dim)
         B, T = x.shape[:2]
-        f = self.encoder(x.flatten(0, 1)).view(B, T, -1)   # (B, T, feat_dim)
+        f = self.encoder(x.flatten(0, 1)).view(B, T, -1)
         if self.temporal == "lstm":
-            f, _ = self.lstm(f)                            # (B, T, feat_dim)
-        return f.mean(dim=1)                               # (B, feat_dim)
+            f, _ = self.lstm(f)
+        return f
 
-    def forward(self, x):
+    def embed(self, x):                          # (B, feat_dim)
+        f = self.step_features(x)
+        return f[:, -1] if self.pool == "last" else f.mean(dim=1)
+
+    def forward(self, x):                        # logits (B, C)
         return self.head(self.drop(self.embed(x)))
+
+    def forward_steps(self, x):                  # logits tai MOI buoc thoi gian (B, T, C)
+        return self.head(self.drop(self.step_features(x)))
 
 
 class GEIEmbedCNN(_GEICNN):

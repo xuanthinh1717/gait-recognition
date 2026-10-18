@@ -15,11 +15,11 @@ CONDS = ("nm", "bg", "cl")
 DEFAULT_DROPOUT = {"gei": 0.1, "lstm": 0.3, "mean": 0.3}
 
 
-def build_model(name, num_classes, dropout=None):
+def build_model(name, num_classes, dropout=None, pool="mean"):
     dropout = DEFAULT_DROPOUT[name] if dropout is None else dropout
     if name == "gei":
         return GEIEmbedCNN(num_classes=num_classes, num_conv_blocks=3, dropout=dropout)
-    return CNNLSTM(num_classes, temporal=name, dropout=dropout)
+    return CNNLSTM(num_classes, temporal=name, dropout=dropout, pool=pool)
 
 
 def make_dataset(name, csv_file, frames_path, T, train):

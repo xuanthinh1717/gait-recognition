@@ -5,29 +5,40 @@ Train bang softmax tren cac nguoi train; CHON EPOCH bang Rank-1 open-set
 (embedding + cosine) tren cac nguoi validation giu rieng. Khong dung nguoi test.
 
 Vi du:
-    python train_v2.py --model gei  --seed 1
-    python train_v2.py --model lstm --seed 1
-    python train_v2.py --model mean --seed 1
+    python -m src.training.train_v2 --model gei  --seed 1
+    python -m src.training.train_v2 --model lstm --seed 1
+    python -m src.training.train_v2 --model lstm --seed 1 --tag v2 \
+        --clip_grad 1.0 --weight_decay 1e-4 --dropout 0.3 --incremental_loss
 
-Dau ra (khong de len ban cu, ten co tag rieng):
-    outputs_v2/casiab_<model>_seed<N>.pth
-    logs_v2/casiab_<model>_seed<N>.csv
+Tuy chon moi (MAC DINH TAT, nen ket qua cu van tai tao duoc):
+    --tag               them hau to vao ten run, de cac bien the khong de len nhau
+    --clip_grad X       cat chuan gradient (0 = tat)
+    --weight_decay X    >0 thi dung AdamW (0 = Adam nhu cu)
+    --warmup_epochs N   tang lr tuyen tinh trong N epoch dau (tinh theo tung iteration)
+    --incremental_loss  (chi lstm) loss o MOI buoc thoi gian, trong so t^2 (kieu GaitNet)
+    --emb_pool last     (chi lstm) embedding lay o buoc cuoi thay vi trung binh
+
+Dau ra (khong de len ban cu):
+    outputs_v2/casiab_<model>[_<tag>]_seed<N>.pth
+    logs_v2/casiab_<model>[_<tag>]_seed<N>.csv
 """
 import argparse
 import csv
 import json
 import os
 import random
+import re
 import sys
 
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
 
 from src.evaluation.openset_utils_v2 import (build_model, extract_embeddings, make_dataset,
-                              rank1_openset)
+                                              rank1_openset)
 
 
 def seed_everything(seed):
@@ -42,6 +53,20 @@ def seed_worker(_):
     s = torch.initial_seed() % 2**32
     np.random.seed(s)
     random.seed(s)
+
+
+def incremental_loss(model, x, y):
+    """
+    Loss tai moi buoc thoi gian t=1..T voi trong so w_t = t^2 (chuan hoa tong = 1).
+    Tra ve (loss, logits cua buoc cuoi de tinh accuracy).
+    """
+    steps = model.forward_steps(x)                         # (B, T, C)
+    B, T, C = steps.shape
+    w = torch.arange(1, T + 1, device=x.device, dtype=steps.dtype) ** 2
+    w = w / w.sum()
+    ce = F.cross_entropy(steps.reshape(B * T, C), y.repeat_interleave(T),
+                         reduction="none").view(B, T)
+    return (ce * w).sum(dim=1).mean(), steps[:, -1]
 
 
 def main():
@@ -59,12 +84,24 @@ def main():
     ap.add_argument("--out_dir", default="outputs_v2")
     ap.add_argument("--log_dir", default="logs_v2")
     ap.add_argument("--overwrite", action="store_true")
+    # ---- tuy chon moi (mac dinh tat) ----
+    ap.add_argument("--tag", default="", help="hau to ten run (chu va so), vd v1, v2")
+    ap.add_argument("--clip_grad", type=float, default=0.0)
+    ap.add_argument("--weight_decay", type=float, default=0.0)
+    ap.add_argument("--warmup_epochs", type=float, default=0.0)
+    ap.add_argument("--incremental_loss", action="store_true")
+    ap.add_argument("--emb_pool", default="mean", choices=["mean", "last"])
     args = ap.parse_args()
+
+    if args.tag and not re.fullmatch(r"[A-Za-z0-9]+", args.tag):
+        sys.exit("--tag chi gom chu va so (khong dau gach).")
+    if args.model != "lstm" and (args.incremental_loss or args.emb_pool != "mean"):
+        sys.exit("--incremental_loss va --emb_pool last chi dung voi --model lstm.")
 
     if args.batch_size is None:
         args.batch_size = 128 if args.model == "gei" else 16
 
-    tag = f"casiab_{args.model}_seed{args.seed}"
+    tag = f"casiab_{args.model}" + (f"_{args.tag}" if args.tag else "") + f"_seed{args.seed}"
     os.makedirs(args.out_dir, exist_ok=True)
     os.makedirs(args.log_dir, exist_ok=True)
     ckpt_path = os.path.join(args.out_dir, f"{tag}.pth")
@@ -75,6 +112,9 @@ def main():
     seed_everything(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("Device:", device, "| run:", tag)
+    print("Cau hinh:", {k: v for k, v in vars(args).items()
+                        if k in ("lr", "dropout", "batch_size", "T", "epochs", "clip_grad",
+                                 "weight_decay", "warmup_epochs", "incremental_loss", "emb_pool")})
 
     sp = args.splits
     num_classes = json.load(open(os.path.join(sp, "split_info.json")))["num_train_classes"]
@@ -91,10 +131,19 @@ def main():
         pin_memory=(device.type == "cuda"),
     )
 
-    model = build_model(args.model, num_classes, args.dropout).to(device)
+    model = build_model(args.model, num_classes, args.dropout, args.emb_pool).to(device)
     print("Tham so:", sum(p.numel() for p in model.parameters()))
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=args.lr)
+    if args.weight_decay > 0:
+        optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    else:
+        optimizer = optim.Adam(model.parameters(), lr=args.lr)
+
+    scheduler = None
+    warm_iters = int(args.warmup_epochs * len(train_loader))
+    if warm_iters > 0:
+        scheduler = optim.lr_scheduler.LambdaLR(
+            optimizer, lambda it: min(1.0, (it + 1) / warm_iters))
 
     with open(log_path, "w", newline="") as f:
         csv.writer(f).writerow(
@@ -108,10 +157,17 @@ def main():
         for x, y in train_loader:
             x, y = x.to(device), y.to(device)
             optimizer.zero_grad()
-            out = model(x)
-            loss = criterion(out, y)
+            if args.incremental_loss:
+                loss, out = incremental_loss(model, x, y)
+            else:
+                out = model(x)
+                loss = criterion(out, y)
             loss.backward()
+            if args.clip_grad > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
             optimizer.step()
+            if scheduler is not None:
+                scheduler.step()
             run_loss += loss.item()
             correct += (out.argmax(1) == y).sum().item()
             total += y.size(0)

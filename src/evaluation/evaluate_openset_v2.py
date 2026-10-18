@@ -25,7 +25,8 @@ from src.evaluation.openset_utils_v2 import (CONDS, build_model, extract_embeddi
 def evaluate(ckpt_path, split, splits_dir, frames, device, num_workers):
     ck = torch.load(ckpt_path, map_location=device)
     a = ck["args"]
-    model = build_model(a["model"], ck["num_classes"], a["dropout"]).to(device)
+    model = build_model(a["model"], ck["num_classes"], a["dropout"],
+                        pool=a.get("emb_pool", "mean")).to(device)
     model.load_state_dict(ck["model"])
     model.eval()
 
@@ -70,7 +71,8 @@ def main():
             path, args.split, args.splits, args.frames, device, args.num_workers)
         name = os.path.splitext(os.path.basename(path))[0]
         print_run(name, ck, per_cond, per_angle)
-        runs.append((name, a["model"], per_cond))
+        key = a["model"] + (f"_{a['tag']}" if a.get("tag") else "")
+        runs.append((name, key, per_cond))
         with open(os.path.join(args.out_dir, f"{name}_{args.split}.json"), "w") as f:
             json.dump({"ckpt": path, "split": args.split, "per_cond": per_cond,
                        "per_angle": per_angle}, f, indent=2)
@@ -78,7 +80,7 @@ def main():
     if len(runs) > 1:
         models = {m for _, m, _ in runs}
         if len(models) > 1:
-            print("\n(Cac checkpoint thuoc nhieu model khac nhau, bo qua mean+-std.)")
+            print("\n(Cac checkpoint thuoc nhieu model/bien the khac nhau, bo qua mean+-std.)")
             return
         print(f"\n=== Tong hop {len(runs)} run, model {models.pop()}, split {args.split} ===")
         for k in list(CONDS) + ["mean"]:
