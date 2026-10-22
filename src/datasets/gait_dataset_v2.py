@@ -21,13 +21,16 @@ CSV_DTYPES = {"subj_dir": str, "angle_dir": str}
 
 class SeqDataset(Dataset):
     """
-    train=True : lay mot doan lien tuc T frame o vi tri ngau nhien.
-    train=False: lay T frame cach deu nhau tren toan video (co dinh, lap lai duoc).
+    train=True : lay mot doan lien tuc T frame o vi tri ngau nhien (uu tien vung giua video
+                 khi video dai de tranh cac frame dau/cuoi bi khuat nguoi).
+    train=False: lay T frame lien tuc o chinh giua video (center clip) de dong bo
+                 toc do chuyen dong (stride=1) voi luc train cho LSTM.
     Video ngan hon T: tai su dung frame theo vong (chi so modulo).
     """
 
     def __init__(self, csv_file, frames_path="data/npy/casiab_v2/frames.npy",
-                 T=30, train=False):
+                 T=30, train=False, eval_sample="center"):
+        assert eval_sample in ("center", "linspace")
         self.df = pd.read_csv(csv_file, dtype=CSV_DTYPES)
         self.starts = self.df["start"].to_numpy()
         self.lengths = self.df["length"].to_numpy()
@@ -35,6 +38,7 @@ class SeqDataset(Dataset):
         self.frames_path = frames_path
         self.T = T
         self.train = train
+        self.eval_sample = eval_sample
         self._frames = None  # mo mmap o moi worker, khong pickle qua process
 
     def __len__(self):
@@ -53,6 +57,9 @@ class SeqDataset(Dataset):
                 return np.arange(off, off + T)
             return np.arange(T) % length
         if length >= T:
+            if self.eval_sample == "center":
+                off = (length - T) // 2
+                return np.arange(off, off + T)
             return np.linspace(0, length - 1, T).round().astype(int)
         return np.arange(T) % length
 

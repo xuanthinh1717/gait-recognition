@@ -20,21 +20,41 @@ except ImportError:  # chay doc lap trong cung thu muc
 
 
 class FrameEncoder(nn.Module):
-    """Giong 3 khoi conv + CBAM(64) cua model hien tai, nhung GAP + FC thay cho Flatten."""
+    """
+    3 khoi Conv + BatchNorm + CBAM(64, reduction=4).
+    Dung AdaptiveAvgPool2d((8, 2)) thay vi GAP(1x1) de giu cau truc doc (dau->chan)
+    va trai-phai cua dang di truoc khi chieu sang vector out_dim.
+    """
 
     def __init__(self, out_dim=256):
         super().__init__()
         self.conv = nn.Sequential(
-            nn.Conv2d(1, 16, 3, padding=1), nn.ReLU(inplace=True), nn.MaxPool2d(2),
-            nn.Conv2d(16, 32, 3, padding=1), nn.ReLU(inplace=True), nn.MaxPool2d(2),
-            nn.Conv2d(32, 64, 3, padding=1), nn.ReLU(inplace=True),
-            CBAMBlock(64),
+            nn.Conv2d(1, 16, 3, padding=1, bias=False),
+            nn.BatchNorm2d(16),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),                                # 64 -> 32
+
+            nn.Conv2d(16, 32, 3, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),                                # 32 -> 16
+
+            nn.Conv2d(32, 64, 3, padding=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2),                                # 16 -> 8
+            CBAMBlock(64, reduction=4),
         )
-        self.gap = nn.AdaptiveAvgPool2d(1)
-        self.fc = nn.Linear(64, out_dim)
+        # Giu 8 dai ngang (dau -> chan) x 2 nua (trai - phai) -> 64 * 8 * 2 = 1024
+        self.pool = nn.AdaptiveAvgPool2d((8, 2))
+        self.fc = nn.Sequential(
+            nn.Linear(64 * 8 * 2, out_dim, bias=False),
+            nn.BatchNorm1d(out_dim),
+            nn.ReLU(inplace=True),
+        )
 
     def forward(self, x):                        # (N, 1, S, S)
-        x = self.gap(self.conv(x)).flatten(1)    # (N, 64)
+        x = self.pool(self.conv(x)).flatten(1)   # (N, 1024)
         return self.fc(x)                        # (N, out_dim)
 
 
@@ -59,6 +79,8 @@ class CNNLSTM(nn.Module):
         if temporal == "lstm":
             # hidden = feat_dim de B va E co cung so chieu embedding (256)
             self.lstm = nn.LSTM(feat_dim, feat_dim, batch_first=True)
+        # BNNeck giup chuan hoa phan pho vector dac trung cho khoang cach cosine
+        self.bn = nn.BatchNorm1d(feat_dim)
         self.drop = nn.Dropout(dropout)
         self.head = nn.Linear(feat_dim, num_classes)
 
@@ -71,13 +93,17 @@ class CNNLSTM(nn.Module):
 
     def embed(self, x):                          # (B, feat_dim)
         f = self.step_features(x)
-        return f[:, -1] if self.pool == "last" else f.mean(dim=1)
+        pooled = f[:, -1] if self.pool == "last" else f.mean(dim=1)
+        return self.bn(pooled)
 
     def forward(self, x):                        # logits (B, C)
         return self.head(self.drop(self.embed(x)))
 
     def forward_steps(self, x):                  # logits tai MOI buoc thoi gian (B, T, C)
-        return self.head(self.drop(self.step_features(x)))
+        f = self.step_features(x)
+        B, T, D = f.shape
+        f_bn = self.bn(f.reshape(B * T, D)).view(B, T, D)
+        return self.head(self.drop(f_bn))
 
 
 class GEIEmbedCNN(_GEICNN):

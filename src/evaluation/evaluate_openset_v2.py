@@ -30,8 +30,11 @@ def evaluate(ckpt_path, split, splits_dir, frames, device, num_workers):
     model.load_state_dict(ck["model"])
     model.eval()
 
-    g = make_dataset(a["model"], f"{splits_dir}/{split}_gallery.csv", frames, a["T"], train=False)
-    p = make_dataset(a["model"], f"{splits_dir}/{split}_probe.csv", frames, a["T"], train=False)
+    eval_sample = a.get("eval_sample", "center")
+    g = make_dataset(a["model"], f"{splits_dir}/{split}_gallery.csv", frames, a["T"],
+                     train=False, eval_sample=eval_sample)
+    p = make_dataset(a["model"], f"{splits_dir}/{split}_probe.csv", frames, a["T"],
+                     train=False, eval_sample=eval_sample)
     bs = 64 if a["model"] == "gei" else 16
     g_emb = extract_embeddings(model, g, device, bs, num_workers)
     p_emb = extract_embeddings(model, p, device, bs, num_workers)

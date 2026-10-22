@@ -22,10 +22,11 @@ def build_model(name, num_classes, dropout=None, pool="mean"):
     return CNNLSTM(num_classes, temporal=name, dropout=dropout, pool=pool)
 
 
-def make_dataset(name, csv_file, frames_path, T, train):
+def make_dataset(name, csv_file, frames_path, T, train, eval_sample="center"):
     if name == "gei":
         return GEIDataset(csv_file)
-    return SeqDataset(csv_file, frames_path=frames_path, T=T, train=train)
+    return SeqDataset(csv_file, frames_path=frames_path, T=T, train=train,
+                      eval_sample=eval_sample)
 
 
 @torch.no_grad()

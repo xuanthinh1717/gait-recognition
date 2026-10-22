@@ -91,6 +91,8 @@ def main():
     ap.add_argument("--warmup_epochs", type=float, default=0.0)
     ap.add_argument("--incremental_loss", action="store_true")
     ap.add_argument("--emb_pool", default="mean", choices=["mean", "last"])
+    ap.add_argument("--eval_sample", default="center", choices=["center", "linspace"],
+                    help="cach lay T frame khi val/test (center: T frame lien tuc o giua video)")
     args = ap.parse_args()
 
     if args.tag and not re.fullmatch(r"[A-Za-z0-9]+", args.tag):
@@ -114,15 +116,19 @@ def main():
     print("Device:", device, "| run:", tag)
     print("Cau hinh:", {k: v for k, v in vars(args).items()
                         if k in ("lr", "dropout", "batch_size", "T", "epochs", "clip_grad",
-                                 "weight_decay", "warmup_epochs", "incremental_loss", "emb_pool")})
+                                 "weight_decay", "warmup_epochs", "incremental_loss",
+                                 "emb_pool", "eval_sample")})
 
     sp = args.splits
     num_classes = json.load(open(os.path.join(sp, "split_info.json")))["num_train_classes"]
     print("num_classes:", num_classes)
 
-    train_ds = make_dataset(args.model, f"{sp}/train.csv", args.frames, args.T, train=True)
-    val_g = make_dataset(args.model, f"{sp}/val_gallery.csv", args.frames, args.T, train=False)
-    val_p = make_dataset(args.model, f"{sp}/val_probe.csv", args.frames, args.T, train=False)
+    train_ds = make_dataset(args.model, f"{sp}/train.csv", args.frames, args.T, train=True,
+                            eval_sample=args.eval_sample)
+    val_g = make_dataset(args.model, f"{sp}/val_gallery.csv", args.frames, args.T, train=False,
+                         eval_sample=args.eval_sample)
+    val_p = make_dataset(args.model, f"{sp}/val_probe.csv", args.frames, args.T, train=False,
+                         eval_sample=args.eval_sample)
 
     gen = torch.Generator().manual_seed(args.seed)
     train_loader = DataLoader(
