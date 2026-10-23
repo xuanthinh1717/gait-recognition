@@ -25,12 +25,15 @@ class SeqDataset(Dataset):
                  khi video dai de tranh cac frame dau/cuoi bi khuat nguoi).
     train=False: lay T frame lien tuc o chinh giua video (center clip) de dong bo
                  toc do chuyen dong (stride=1) voi luc train cho LSTM.
+    ff_gei_m > 0: bien moi frame i thanh anh ff-GEI (trung binh 2*m + 1 frame quanh i
+                  theo bai bao Wang & Yan 2019: F_i = 1/(2m+1) * sum_{t=i-m}^{i+m} I_t).
     Video ngan hon T: tai su dung frame theo vong (chi so modulo).
     """
 
     def __init__(self, csv_file, frames_path="data/npy/casiab_v2/frames.npy",
-                 T=30, train=False, eval_sample="center"):
+                 T=30, train=False, eval_sample="center", ff_gei_m=0):
         assert eval_sample in ("center", "linspace")
+        assert ff_gei_m >= 0
         self.df = pd.read_csv(csv_file, dtype=CSV_DTYPES)
         self.starts = self.df["start"].to_numpy()
         self.lengths = self.df["length"].to_numpy()
@@ -39,6 +42,7 @@ class SeqDataset(Dataset):
         self.T = T
         self.train = train
         self.eval_sample = eval_sample
+        self.ff_gei_m = int(ff_gei_m)
         self._frames = None  # mo mmap o moi worker, khong pickle qua process
 
     def __len__(self):
@@ -66,7 +70,15 @@ class SeqDataset(Dataset):
     def __getitem__(self, idx):
         start, length = int(self.starts[idx]), int(self.lengths[idx])
         rel = self._pick(length)
-        seq = np.asarray(self._get_frames()[start + rel], dtype=np.float32) / 255.0
+        frames = self._get_frames()
+        if self.ff_gei_m > 0:
+            offsets = np.arange(-self.ff_gei_m, self.ff_gei_m + 1)
+            win_idx = np.clip(rel[:, None] + offsets[None, :], 0, length - 1)
+            lo, hi = int(win_idx.min()), int(win_idx.max()) + 1
+            block = np.asarray(frames[start + lo : start + hi], dtype=np.float32)
+            seq = block[win_idx - lo].mean(axis=1) / 255.0
+        else:
+            seq = np.asarray(frames[start + rel], dtype=np.float32) / 255.0
         x = torch.from_numpy(seq).unsqueeze(1)          # (T, 1, S, S)
         return x, torch.tensor(int(self.labels[idx]), dtype=torch.long)
 

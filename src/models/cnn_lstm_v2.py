@@ -1,22 +1,21 @@
 """
 cnn_lstm_v2.py
 
-Cac model cho thi nghiem open-set. Moi model co:
-    forward(x) -> logits        (de train bang softmax tren cac nguoi train)
+Model chuoi frame (cau hinh B va E) cho thi nghiem open-set. Moi model co:
+    forward(x) -> logits        (de train bang softmax / triplet tren cac nguoi train)
     embed(x)   -> vector dac trung (de so khop cosine luc danh gia open-set)
 
     CNNLSTM(temporal="lstm") : cau hinh B  (CNN tung frame -> LSTM -> trung binh theo T)
     CNNLSTM(temporal="mean") : cau hinh E  (CNN tung frame -> trung binh theo T, KHONG LSTM)
-    GEIEmbedCNN              : cau hinh D  (CNN+CBAM hien tai tren GEI, chi them embed())
 
 B va E dung CHUNG FrameEncoder, chi khac cach gop thoi gian.
 """
 import torch.nn as nn
 
 try:
-    from src.models.cnn_model_attention import CNN as _GEICNN, CBAMBlock
+    from src.models.cnn_model_attention import CBAMBlock
 except ImportError:  # chay doc lap trong cung thu muc
-    from cnn_model_attention import CNN as _GEICNN, CBAMBlock
+    from cnn_model_attention import CBAMBlock
 
 
 class FrameEncoder(nn.Module):
@@ -67,7 +66,8 @@ class CNNLSTM(nn.Module):
         "last": chi lay buoc cuoi (chi co nghia voi LSTM)
     """
 
-    def __init__(self, num_classes, temporal="lstm", feat_dim=256, dropout=0.3, pool="mean"):
+    def __init__(self, num_classes, temporal="lstm", feat_dim=256, dropout=0.3,
+                 pool="mean", lstm_layers=1):
         super().__init__()
         assert temporal in ("lstm", "mean")
         assert pool in ("mean", "last")
@@ -75,10 +75,15 @@ class CNNLSTM(nn.Module):
             raise ValueError("pool='last' chi dung cho temporal='lstm'")
         self.temporal = temporal
         self.pool = pool
+        self.lstm_layers = lstm_layers
         self.encoder = FrameEncoder(feat_dim)
         if temporal == "lstm":
             # hidden = feat_dim de B va E co cung so chieu embedding (256)
-            self.lstm = nn.LSTM(feat_dim, feat_dim, batch_first=True)
+            lstm_drop = dropout if lstm_layers > 1 else 0.0
+            self.lstm = nn.LSTM(
+                feat_dim, feat_dim, num_layers=lstm_layers,
+                batch_first=True, dropout=lstm_drop
+            )
         # BNNeck giup chuan hoa phan pho vector dac trung cho khoang cach cosine
         self.bn = nn.BatchNorm1d(feat_dim)
         self.drop = nn.Dropout(dropout)
@@ -110,21 +115,3 @@ class CNNLSTM(nn.Module):
             pooled = f[:, -1] if self.pool == "last" else f.mean(dim=1)
             return steps, self.bn(pooled)
         return steps
-
-
-class GEIEmbedCNN(_GEICNN):
-    """CNN+CBAM hien tai (cnn_model_attention.CNN), them embed(). Khong doi kien truc."""
-
-    def embed(self, x):
-        x = self.block1(x)
-        x = self.block2(x)
-        if self.cbam2 is not None:
-            x = self.cbam2(x)
-        if self.block3 is not None:
-            x = self.cbam3(self.block3(x))
-        return self.classifier[:-1](x)           # bo Linear cuoi -> (B, 2048)
-
-    def forward(self, x, return_embed=False):
-        emb = self.embed(x)
-        logits = self.classifier[-1](emb)
-        return (logits, emb) if return_embed else logits

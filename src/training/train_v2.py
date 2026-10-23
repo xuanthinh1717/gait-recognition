@@ -21,6 +21,10 @@ Tuy chon moi (MAC DINH TAT, nen ket qua cu van tai tao duoc):
     --triplet_margin M  bien do margin cho Triplet Loss (mac dinh 0.2)
     --pk_k K            so video moi nguoi trong 1 batch khi dung Triplet Loss (mac dinh 4)
     --label_smoothing S label smoothing cho CrossEntropyLoss (mac dinh 0.0)
+    --decay_acc A       khi train_acc >= A (%) thi bat dau giam lr theo cosine ve min_lr (0 = tat)
+    --min_lr L          lr toi thieu khi giam lr (mac dinh 1e-5)
+    --ff_gei_m M        ban kinh cua so truot ff-GEI (2*M+1 frame quanh moi buoc, 0 = frame thuong)
+    --lstm_layers N     so tang LSTM chong len nhau (mac dinh 1; bai bao Conv-LSTM dung 3)
 
 Dau ra (khong de len ban cu):
     outputs_v2/casiab_<model>[_<tag>]_seed<N>.pth
@@ -30,6 +34,7 @@ import argparse
 from collections import defaultdict
 import csv
 import json
+import math
 import os
 import random
 import re
@@ -154,6 +159,8 @@ def main():
     ap.add_argument("--lr", type=float, default=1e-4)
     ap.add_argument("--batch_size", type=int, default=None, help="mac dinh: gei=128, lstm/mean=16")
     ap.add_argument("--dropout", type=float, default=None, help="mac dinh: gei=0.1, lstm/mean=0.3")
+    ap.add_argument("--feat_dim", type=int, default=None,
+                    help="so chieu embedding (mac dinh: gei=1024, lstm/mean=256; OUMVLP gei=2048)")
     ap.add_argument("--T", type=int, default=30, help="so frame moi chuoi (lstm/mean)")
     ap.add_argument("--num_workers", type=int, default=4)
     ap.add_argument("--splits", default="data/splits_v2")
@@ -176,12 +183,21 @@ def main():
     ap.add_argument("--pk_k", type=int, default=4,
                     help="so mau moi nguoi trong 1 batch khi triplet_weight > 0")
     ap.add_argument("--label_smoothing", type=float, default=0.0)
+    ap.add_argument("--decay_acc", type=float, default=0.0,
+                    help="nguong train_acc (%%) bat dau giam lr theo cosine ve min_lr (vd 99.0; 0=tat)")
+    ap.add_argument("--min_lr", type=float, default=1e-5,
+                    help="lr toi thieu khi giam lr (mac dinh 1e-5)")
+    ap.add_argument("--ff_gei_m", type=int, default=0,
+                    help="ban kinh cua so truot ff-GEI (2*m+1 frame quanh moi buoc, 0=tat)")
+    ap.add_argument("--lstm_layers", type=int, default=1,
+                    help="so tang LSTM chong len nhau (mac dinh 1)")
     args = ap.parse_args()
 
     if args.tag and not re.fullmatch(r"[A-Za-z0-9]+", args.tag):
         sys.exit("--tag chi gom chu va so (khong dau gach).")
-    if args.model != "lstm" and (args.incremental_loss or args.emb_pool != "mean"):
-        sys.exit("--incremental_loss va --emb_pool last chi dung voi --model lstm.")
+    if args.model != "lstm" and (args.incremental_loss or args.emb_pool != "mean"
+                                 or args.lstm_layers != 1):
+        sys.exit("--incremental_loss, --emb_pool last, --lstm_layers chi dung voi --model lstm.")
 
     if args.batch_size is None:
         args.batch_size = 128 if args.model == "gei" else 16
@@ -198,21 +214,22 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("Device:", device, "| run:", tag)
     print("Cau hinh:", {k: v for k, v in vars(args).items()
-                        if k in ("lr", "dropout", "batch_size", "T", "epochs", "clip_grad",
-                                 "weight_decay", "warmup_epochs", "incremental_loss",
+                        if k in ("lr", "dropout", "feat_dim", "batch_size", "T", "epochs",
+                                 "clip_grad", "weight_decay", "warmup_epochs", "incremental_loss",
                                  "emb_pool", "eval_sample", "triplet_weight",
-                                 "triplet_margin", "pk_k", "label_smoothing")})
+                                 "triplet_margin", "pk_k", "label_smoothing",
+                                 "decay_acc", "min_lr", "ff_gei_m", "lstm_layers")})
 
     sp = args.splits
     num_classes = json.load(open(os.path.join(sp, "split_info.json")))["num_train_classes"]
     print("num_classes:", num_classes)
 
     train_ds = make_dataset(args.model, f"{sp}/train.csv", args.frames, args.T, train=True,
-                            eval_sample=args.eval_sample)
+                            eval_sample=args.eval_sample, ff_gei_m=args.ff_gei_m)
     val_g = make_dataset(args.model, f"{sp}/val_gallery.csv", args.frames, args.T, train=False,
-                         eval_sample=args.eval_sample)
+                         eval_sample=args.eval_sample, ff_gei_m=args.ff_gei_m)
     val_p = make_dataset(args.model, f"{sp}/val_probe.csv", args.frames, args.T, train=False,
-                         eval_sample=args.eval_sample)
+                         eval_sample=args.eval_sample, ff_gei_m=args.ff_gei_m)
 
     gen = torch.Generator().manual_seed(args.seed)
     if args.triplet_weight > 0:
@@ -230,7 +247,8 @@ def main():
             pin_memory=(device.type == "cuda"),
         )
 
-    model = build_model(args.model, num_classes, args.dropout, args.emb_pool).to(device)
+    model = build_model(args.model, num_classes, args.dropout, args.emb_pool,
+                        feat_dim=args.feat_dim, lstm_layers=args.lstm_layers).to(device)
     print("Tham so:", sum(p.numel() for p in model.parameters()))
     criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
     if args.weight_decay > 0:
@@ -250,7 +268,16 @@ def main():
 
     best = -1.0
     best_epoch = 0
+    decay_start_epoch = None
     for epoch in range(1, args.epochs + 1):
+        if decay_start_epoch is not None:
+            scheduler = None
+            rem = max(1, args.epochs - decay_start_epoch)
+            prog = min(1.0, (epoch - decay_start_epoch) / rem)
+            cur_lr = args.min_lr + 0.5 * (args.lr - args.min_lr) * (1.0 + math.cos(math.pi * prog))
+            for pg in optimizer.param_groups:
+                pg["lr"] = cur_lr
+
         model.train()
         run_loss, correct, total = 0.0, 0, 0
         for x, y in train_loader:
@@ -282,9 +309,15 @@ def main():
         p_emb = extract_embeddings(model, val_p, device, bs, args.num_workers)
         res, _ = rank1_openset(val_g.df, g_emb, val_p.df, p_emb)
 
-        print(f"Epoch [{epoch}/{args.epochs}] loss {tr_loss:.4f} acc {tr_acc:.2f}% | "
+        cur_lr = optimizer.param_groups[0]["lr"]
+        print(f"Epoch [{epoch}/{args.epochs}] lr {cur_lr:.2e} loss {tr_loss:.4f} acc {tr_acc:.2f}% | "
               f"val Rank-1 NM {res['nm']:.1f} BG {res['bg']:.1f} CL {res['cl']:.1f} "
               f"mean {res['mean']:.2f}")
+
+        if args.decay_acc > 0 and decay_start_epoch is None and tr_acc >= args.decay_acc:
+            decay_start_epoch = epoch
+            print(f"  -> train_acc {tr_acc:.2f}% >= {args.decay_acc:.1f}%, "
+                  f"bat dau giam lr theo cosine tu epoch {epoch + 1} ve {args.min_lr:.1e}")
 
         if res["mean"] > best:
             best, best_epoch = res["mean"], epoch

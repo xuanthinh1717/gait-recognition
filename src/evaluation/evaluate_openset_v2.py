@@ -26,15 +26,18 @@ def evaluate(ckpt_path, split, splits_dir, frames, device, num_workers):
     ck = torch.load(ckpt_path, map_location=device)
     a = ck["args"]
     model = build_model(a["model"], ck["num_classes"], a["dropout"],
-                        pool=a.get("emb_pool", "mean")).to(device)
+                        pool=a.get("emb_pool", "mean"),
+                        feat_dim=a.get("feat_dim", None),
+                        lstm_layers=a.get("lstm_layers", 1)).to(device)
     model.load_state_dict(ck["model"])
     model.eval()
 
     eval_sample = a.get("eval_sample", "center")
+    ff_gei_m = a.get("ff_gei_m", 0)
     g = make_dataset(a["model"], f"{splits_dir}/{split}_gallery.csv", frames, a["T"],
-                     train=False, eval_sample=eval_sample)
+                     train=False, eval_sample=eval_sample, ff_gei_m=ff_gei_m)
     p = make_dataset(a["model"], f"{splits_dir}/{split}_probe.csv", frames, a["T"],
-                     train=False, eval_sample=eval_sample)
+                     train=False, eval_sample=eval_sample, ff_gei_m=ff_gei_m)
     bs = 64 if a["model"] == "gei" else 16
     g_emb = extract_embeddings(model, g, device, bs, num_workers)
     p_emb = extract_embeddings(model, p, device, bs, num_workers)

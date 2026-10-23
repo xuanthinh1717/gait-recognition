@@ -8,25 +8,29 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from src.models.cnn_lstm_v2 import CNNLSTM, GEIEmbedCNN
+from src.models.cnn_gei_v2 import GEIEmbedCNN
+from src.models.cnn_lstm_v2 import CNNLSTM
 from src.datasets.gait_dataset_v2 import GEIDataset, SeqDataset
 
 CONDS = ("nm", "bg", "cl")
 DEFAULT_DROPOUT = {"gei": 0.1, "lstm": 0.3, "mean": 0.3}
+DEFAULT_FEAT_DIM = {"gei": 1024, "lstm": 256, "mean": 256}
 
 
-def build_model(name, num_classes, dropout=None, pool="mean"):
+def build_model(name, num_classes, dropout=None, pool="mean", feat_dim=None, lstm_layers=1):
     dropout = DEFAULT_DROPOUT[name] if dropout is None else dropout
+    feat_dim = DEFAULT_FEAT_DIM[name] if feat_dim is None else feat_dim
     if name == "gei":
-        return GEIEmbedCNN(num_classes=num_classes, num_conv_blocks=3, dropout=dropout)
-    return CNNLSTM(num_classes, temporal=name, dropout=dropout, pool=pool)
+        return GEIEmbedCNN(num_classes=num_classes, feat_dim=feat_dim, dropout=dropout)
+    return CNNLSTM(num_classes, temporal=name, feat_dim=feat_dim, dropout=dropout,
+                   pool=pool, lstm_layers=lstm_layers)
 
 
-def make_dataset(name, csv_file, frames_path, T, train, eval_sample="center"):
+def make_dataset(name, csv_file, frames_path, T, train, eval_sample="center", ff_gei_m=0):
     if name == "gei":
         return GEIDataset(csv_file)
     return SeqDataset(csv_file, frames_path=frames_path, T=T, train=train,
-                      eval_sample=eval_sample)
+                      eval_sample=eval_sample, ff_gei_m=ff_gei_m)
 
 
 @torch.no_grad()
