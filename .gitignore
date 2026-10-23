@@ -3,6 +3,7 @@ outputs/
 logs/
 logs_v2/
 logs_v2_lr1e3
+results_v2/
 results_v2_lr1e3
 __pycache__/
 *.pth
