@@ -17,12 +17,17 @@ Tuy chon moi (MAC DINH TAT, nen ket qua cu van tai tao duoc):
     --warmup_epochs N   tang lr tuyen tinh trong N epoch dau (tinh theo tung iteration)
     --incremental_loss  (chi lstm) loss o MOI buoc thoi gian, trong so t^2 (kieu GaitNet)
     --emb_pool last     (chi lstm) embedding lay o buoc cuoi thay vi trung binh
+    --triplet_weight X  trong so Batch-Hard Cosine Triplet Loss (>0 se bat PKSampler)
+    --triplet_margin M  bien do margin cho Triplet Loss (mac dinh 0.2)
+    --pk_k K            so video moi nguoi trong 1 batch khi dung Triplet Loss (mac dinh 4)
+    --label_smoothing S label smoothing cho CrossEntropyLoss (mac dinh 0.0)
 
 Dau ra (khong de len ban cu):
     outputs_v2/casiab_<model>[_<tag>]_seed<N>.pth
     logs_v2/casiab_<model>[_<tag>]_seed<N>.csv
 """
 import argparse
+from collections import defaultdict
 import csv
 import json
 import os
@@ -35,7 +40,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Sampler
 
 from src.evaluation.openset_utils_v2 import (build_model, extract_embeddings, make_dataset,
                                               rank1_openset)
@@ -55,18 +60,90 @@ def seed_worker(_):
     random.seed(s)
 
 
-def incremental_loss(model, x, y):
+class PKSampler(Sampler):
+    """
+    Moi batch gom P nguoi x K video/nguoi (batch_size = P * K).
+    Dam bao trong batch luon co cac cap cung nguoi (positive) va khac nguoi (negative)
+    de tinh Triplet Loss.
+    """
+
+    def __init__(self, labels, batch_size, k=4, seed=1):
+        assert batch_size % k == 0, f"batch_size ({batch_size}) phai chia het cho pk_k ({k})"
+        self.p = batch_size // k
+        self.k = k
+        self.seed = seed
+        self.epoch = 0
+        self.by_label = defaultdict(list)
+        for idx, y in enumerate(labels):
+            self.by_label[int(y)].append(idx)
+        assert len(self.by_label) >= self.p, "So lop train it hon P nguoi moi batch"
+        self.num_batches = len(labels) // batch_size
+
+    def __len__(self):
+        return self.num_batches
+
+    def __iter__(self):
+        rng = random.Random(self.seed + self.epoch * 1009)
+        self.epoch += 1
+        pools = {}
+        for y, idxs in self.by_label.items():
+            buf = list(idxs)
+            rng.shuffle(buf)
+            pools[y] = buf
+
+        classes = list(self.by_label.keys())
+        for _ in range(self.num_batches):
+            chosen = rng.sample(classes, self.p)
+            batch = []
+            for y in chosen:
+                if len(pools[y]) < self.k:
+                    buf = list(self.by_label[y])
+                    rng.shuffle(buf)
+                    pools[y].extend(buf)
+                batch.extend(pools[y][:self.k])
+                del pools[y][:self.k]
+            yield batch
+
+
+def batch_hard_triplet_loss(emb, y, margin=0.2):
+    """
+    Batch-Hard Triplet Loss tren khoang cach Cosine: d(u, v) = 1 - cos(u, v).
+    Voi moi anchor i:
+        hard_pos = max_{j: y_j == y_i} d(i, j)
+        hard_neg = min_{k: y_k != y_i} d(i, k)
+        loss_i   = relu(hard_pos - hard_neg + margin)
+    """
+    z = F.normalize(emb, p=2, dim=1)
+    dist = (1.0 - z @ z.T).clamp(min=0.0)
+    eye = torch.eye(y.size(0), dtype=torch.bool, device=y.device)
+    same = y.unsqueeze(0) == y.unsqueeze(1)
+    pos_mask = same & ~eye
+    neg_mask = ~same
+
+    if not pos_mask.any(dim=1).all() or not neg_mask.any(dim=1).all():
+        return emb.new_tensor(0.0)
+
+    # Hardest positive: gan -inf cho cac vi tri khong phai positive
+    hard_pos = dist.masked_fill(~pos_mask, -1e9).max(dim=1).values
+
+    # Hardest negative: gan +inf cho cac vi tri cung lop
+    hard_neg = dist.masked_fill(~neg_mask, 1e9).min(dim=1).values
+
+    return F.relu(hard_pos - hard_neg + margin).mean()
+
+
+def incremental_loss(model, x, y, label_smoothing=0.0):
     """
     Loss tai moi buoc thoi gian t=1..T voi trong so w_t = t^2 (chuan hoa tong = 1).
-    Tra ve (loss, logits cua buoc cuoi de tinh accuracy).
+    Tra ve (loss, logits cua buoc cuoi de tinh accuracy, emb).
     """
-    steps = model.forward_steps(x)                         # (B, T, C)
+    steps, emb = model.forward_steps(x, return_embed=True)  # (B, T, C), (B, D)
     B, T, C = steps.shape
     w = torch.arange(1, T + 1, device=x.device, dtype=steps.dtype) ** 2
     w = w / w.sum()
     ce = F.cross_entropy(steps.reshape(B * T, C), y.repeat_interleave(T),
-                         reduction="none").view(B, T)
-    return (ce * w).sum(dim=1).mean(), steps[:, -1]
+                         reduction="none", label_smoothing=label_smoothing).view(B, T)
+    return (ce * w).sum(dim=1).mean(), steps[:, -1], emb
 
 
 def main():
@@ -93,6 +170,12 @@ def main():
     ap.add_argument("--emb_pool", default="mean", choices=["mean", "last"])
     ap.add_argument("--eval_sample", default="center", choices=["center", "linspace"],
                     help="cach lay T frame khi val/test (center: T frame lien tuc o giua video)")
+    ap.add_argument("--triplet_weight", type=float, default=0.0,
+                    help="trong so Batch-Hard Cosine Triplet Loss (>0 se bat PKSampler)")
+    ap.add_argument("--triplet_margin", type=float, default=0.2)
+    ap.add_argument("--pk_k", type=int, default=4,
+                    help="so mau moi nguoi trong 1 batch khi triplet_weight > 0")
+    ap.add_argument("--label_smoothing", type=float, default=0.0)
     args = ap.parse_args()
 
     if args.tag and not re.fullmatch(r"[A-Za-z0-9]+", args.tag):
@@ -117,7 +200,8 @@ def main():
     print("Cau hinh:", {k: v for k, v in vars(args).items()
                         if k in ("lr", "dropout", "batch_size", "T", "epochs", "clip_grad",
                                  "weight_decay", "warmup_epochs", "incremental_loss",
-                                 "emb_pool", "eval_sample")})
+                                 "emb_pool", "eval_sample", "triplet_weight",
+                                 "triplet_margin", "pk_k", "label_smoothing")})
 
     sp = args.splits
     num_classes = json.load(open(os.path.join(sp, "split_info.json")))["num_train_classes"]
@@ -131,15 +215,24 @@ def main():
                          eval_sample=args.eval_sample)
 
     gen = torch.Generator().manual_seed(args.seed)
-    train_loader = DataLoader(
-        train_ds, batch_size=args.batch_size, shuffle=True, drop_last=True,
-        num_workers=args.num_workers, worker_init_fn=seed_worker, generator=gen,
-        pin_memory=(device.type == "cuda"),
-    )
+    if args.triplet_weight > 0:
+        pk_sampler = PKSampler(train_ds.labels, batch_size=args.batch_size,
+                               k=args.pk_k, seed=args.seed)
+        train_loader = DataLoader(
+            train_ds, batch_sampler=pk_sampler,
+            num_workers=args.num_workers, worker_init_fn=seed_worker, generator=gen,
+            pin_memory=(device.type == "cuda"),
+        )
+    else:
+        train_loader = DataLoader(
+            train_ds, batch_size=args.batch_size, shuffle=True, drop_last=True,
+            num_workers=args.num_workers, worker_init_fn=seed_worker, generator=gen,
+            pin_memory=(device.type == "cuda"),
+        )
 
     model = build_model(args.model, num_classes, args.dropout, args.emb_pool).to(device)
     print("Tham so:", sum(p.numel() for p in model.parameters()))
-    criterion = nn.CrossEntropyLoss()
+    criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
     if args.weight_decay > 0:
         optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     else:
@@ -164,10 +257,13 @@ def main():
             x, y = x.to(device), y.to(device)
             optimizer.zero_grad()
             if args.incremental_loss:
-                loss, out = incremental_loss(model, x, y)
+                loss, out, emb = incremental_loss(model, x, y, args.label_smoothing)
             else:
-                out = model(x)
+                out, emb = model(x, return_embed=True)
                 loss = criterion(out, y)
+            if args.triplet_weight > 0:
+                loss = loss + args.triplet_weight * batch_hard_triplet_loss(
+                    emb, y, margin=args.triplet_margin)
             loss.backward()
             if args.clip_grad > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)

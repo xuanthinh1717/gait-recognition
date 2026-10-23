@@ -96,14 +96,20 @@ class CNNLSTM(nn.Module):
         pooled = f[:, -1] if self.pool == "last" else f.mean(dim=1)
         return self.bn(pooled)
 
-    def forward(self, x):                        # logits (B, C)
-        return self.head(self.drop(self.embed(x)))
+    def forward(self, x, return_embed=False):    # logits (B, C) hoac (logits, emb)
+        emb = self.embed(x)
+        logits = self.head(self.drop(emb))
+        return (logits, emb) if return_embed else logits
 
-    def forward_steps(self, x):                  # logits tai MOI buoc thoi gian (B, T, C)
+    def forward_steps(self, x, return_embed=False):  # logits tai MOI buoc thoi gian (B, T, C)
         f = self.step_features(x)
         B, T, D = f.shape
         f_bn = self.bn(f.reshape(B * T, D)).view(B, T, D)
-        return self.head(self.drop(f_bn))
+        steps = self.head(self.drop(f_bn))
+        if return_embed:
+            pooled = f[:, -1] if self.pool == "last" else f.mean(dim=1)
+            return steps, self.bn(pooled)
+        return steps
 
 
 class GEIEmbedCNN(_GEICNN):
@@ -117,3 +123,8 @@ class GEIEmbedCNN(_GEICNN):
         if self.block3 is not None:
             x = self.cbam3(self.block3(x))
         return self.classifier[:-1](x)           # bo Linear cuoi -> (B, 2048)
+
+    def forward(self, x, return_embed=False):
+        emb = self.embed(x)
+        logits = self.classifier[-1](emb)
+        return (logits, emb) if return_embed else logits
