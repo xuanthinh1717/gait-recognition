@@ -25,6 +25,8 @@ Tuy chon moi (MAC DINH TAT, nen ket qua cu van tai tao duoc):
     --min_lr L          lr toi thieu khi giam lr (mac dinh 1e-5)
     --ff_gei_m M        ban kinh cua so truot ff-GEI (2*M+1 frame quanh moi buoc, 0 = frame thuong)
     --lstm_layers N     so tang LSTM chong len nhau (mac dinh 1; bai bao Conv-LSTM dung 3)
+    --optimizer OPT     bo toi uu: adam (mac dinh) hoac sam (Sharpness-Aware Minimization)
+    --metric_loss LOSS  ham metric loss khi triplet_weight > 0: triplet (mac dinh) hoac supcon
 
 Dau ra (khong de len ban cu):
     outputs_v2/casiab_<model>[_<tag>]_seed<N>.pth
@@ -49,6 +51,7 @@ from torch.utils.data import DataLoader, Sampler
 
 from src.evaluation.openset_utils_v2 import (build_model, extract_embeddings, make_dataset,
                                               rank1_openset)
+from src.training.sam import SAM, disable_running_stats, enable_running_stats
 
 
 def seed_everything(seed):
@@ -137,6 +140,29 @@ def batch_hard_triplet_loss(emb, y, margin=0.2):
     return F.relu(hard_pos - hard_neg + margin).mean()
 
 
+def supcon_loss(emb, y, temperature=0.1):
+    """
+    Supervised Contrastive Loss (Khosla et al., NeurIPS 2020) tren Cosine similarity.
+    Keo TAT CA cac mau cung nguoi (positive) trong batch lai gan nhau,
+    dong thoi day tat ca cac mau khac nguoi (negative) ra xa.
+    """
+    z = F.normalize(emb, p=2, dim=1)
+    sim = (z @ z.T) / temperature
+    sim = sim - sim.max(dim=1, keepdim=True).values.detach()
+
+    eye = torch.eye(y.size(0), dtype=torch.bool, device=y.device)
+    same = y.unsqueeze(0) == y.unsqueeze(1)
+    pos_mask = same & ~eye
+
+    if not pos_mask.any(dim=1).all():
+        return emb.new_tensor(0.0)
+
+    exp_sim = torch.exp(sim).masked_fill(eye, 0.0)
+    log_prob = sim - torch.log(exp_sim.sum(dim=1, keepdim=True) + 1e-12)
+    mean_log_prob_pos = log_prob.masked_fill(~pos_mask, 0.0).sum(dim=1) / pos_mask.sum(dim=1)
+    return -mean_log_prob_pos.mean()
+
+
 def incremental_loss(model, x, y, label_smoothing=0.0):
     """
     Loss tai moi buoc thoi gian t=1..T voi trong so w_t = t^2 (chuan hoa tong = 1).
@@ -149,6 +175,21 @@ def incremental_loss(model, x, y, label_smoothing=0.0):
     ce = F.cross_entropy(steps.reshape(B * T, C), y.repeat_interleave(T),
                          reduction="none", label_smoothing=label_smoothing).view(B, T)
     return (ce * w).sum(dim=1).mean(), steps[:, -1], emb
+
+
+def compute_batch_loss(model, x, y, criterion, args):
+    if args.incremental_loss:
+        loss, out, emb = incremental_loss(model, x, y, args.label_smoothing)
+    else:
+        out, emb = model(x, return_embed=True)
+        loss = criterion(out, y)
+    if args.triplet_weight > 0:
+        if args.metric_loss == "supcon":
+            m_loss = supcon_loss(emb, y)
+        else:
+            m_loss = batch_hard_triplet_loss(emb, y, margin=args.triplet_margin)
+        loss = loss + args.triplet_weight * m_loss
+    return loss, out, emb
 
 
 def main():
@@ -191,6 +232,10 @@ def main():
                     help="ban kinh cua so truot ff-GEI (2*m+1 frame quanh moi buoc, 0=tat)")
     ap.add_argument("--lstm_layers", type=int, default=1,
                     help="so tang LSTM chong len nhau (mac dinh 1)")
+    ap.add_argument("--optimizer", default="adam", choices=["adam", "sam"],
+                    help="bo toi uu: adam (mac dinh) hoac sam (Sharpness-Aware Minimization)")
+    ap.add_argument("--metric_loss", default="triplet", choices=["triplet", "supcon"],
+                    help="ham metric loss khi triplet_weight > 0: triplet (mac dinh) hoac supcon")
     args = ap.parse_args()
 
     if args.tag and not re.fullmatch(r"[A-Za-z0-9]+", args.tag):
@@ -218,7 +263,8 @@ def main():
                                  "clip_grad", "weight_decay", "warmup_epochs", "incremental_loss",
                                  "emb_pool", "eval_sample", "triplet_weight",
                                  "triplet_margin", "pk_k", "label_smoothing",
-                                 "decay_acc", "min_lr", "ff_gei_m", "lstm_layers")})
+                                 "decay_acc", "min_lr", "ff_gei_m", "lstm_layers",
+                                 "optimizer", "metric_loss")})
 
     sp = args.splits
     num_classes = json.load(open(os.path.join(sp, "split_info.json")))["num_train_classes"]
@@ -251,16 +297,19 @@ def main():
                         feat_dim=args.feat_dim, lstm_layers=args.lstm_layers).to(device)
     print("Tham so:", sum(p.numel() for p in model.parameters()))
     criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
-    if args.weight_decay > 0:
-        optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    base_opt_cls = optim.AdamW if args.weight_decay > 0 else optim.Adam
+    opt_kwargs = {"lr": args.lr, "weight_decay": args.weight_decay} if args.weight_decay > 0 else {"lr": args.lr}
+    if args.optimizer == "sam":
+        optimizer = SAM(model.parameters(), base_opt_cls, rho=0.05, **opt_kwargs)
     else:
-        optimizer = optim.Adam(model.parameters(), lr=args.lr)
+        optimizer = base_opt_cls(model.parameters(), **opt_kwargs)
 
     scheduler = None
     warm_iters = int(args.warmup_epochs * len(train_loader))
     if warm_iters > 0:
+        sched_opt = optimizer.base_optimizer if args.optimizer == "sam" else optimizer
         scheduler = optim.lr_scheduler.LambdaLR(
-            optimizer, lambda it: min(1.0, (it + 1) / warm_iters))
+            sched_opt, lambda it: min(1.0, (it + 1) / warm_iters))
 
     with open(log_path, "w", newline="") as f:
         csv.writer(f).writerow(
@@ -282,19 +331,28 @@ def main():
         run_loss, correct, total = 0.0, 0, 0
         for x, y in train_loader:
             x, y = x.to(device), y.to(device)
-            optimizer.zero_grad()
-            if args.incremental_loss:
-                loss, out, emb = incremental_loss(model, x, y, args.label_smoothing)
+            if args.optimizer == "sam":
+                enable_running_stats(model)
+                loss, out, emb = compute_batch_loss(model, x, y, criterion, args)
+                loss.backward()
+                if args.clip_grad > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
+                optimizer.first_step(zero_grad=True)
+
+                disable_running_stats(model)
+                loss2, _, _ = compute_batch_loss(model, x, y, criterion, args)
+                loss2.backward()
+                if args.clip_grad > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
+                optimizer.second_step(zero_grad=True)
             else:
-                out, emb = model(x, return_embed=True)
-                loss = criterion(out, y)
-            if args.triplet_weight > 0:
-                loss = loss + args.triplet_weight * batch_hard_triplet_loss(
-                    emb, y, margin=args.triplet_margin)
-            loss.backward()
-            if args.clip_grad > 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
-            optimizer.step()
+                optimizer.zero_grad()
+                loss, out, emb = compute_batch_loss(model, x, y, criterion, args)
+                loss.backward()
+                if args.clip_grad > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
+                optimizer.step()
+
             if scheduler is not None:
                 scheduler.step()
             run_loss += loss.item()
