@@ -10,9 +10,9 @@ from torch.nn.modules.batchnorm import _BatchNorm
 
 
 class SAM(torch.optim.Optimizer):
-    def __init__(self, params, base_optimizer, rho=0.05, **kwargs):
+    def __init__(self, params, base_optimizer, rho=0.05, adaptive=False, **kwargs):
         assert rho >= 0.0, f"Invalid rho, should be non-negative: {rho}"
-        defaults = dict(rho=rho, **kwargs)
+        defaults = dict(rho=rho, adaptive=adaptive, **kwargs)
         super().__init__(params, defaults)
         self.base_optimizer = base_optimizer(self.param_groups, **kwargs)
         self.param_groups = self.base_optimizer.param_groups
@@ -27,7 +27,7 @@ class SAM(torch.optim.Optimizer):
                 if p.grad is None:
                     continue
                 self.state[p]["old_p"] = p.data.clone()
-                e_w = p.grad * scale.to(p)
+                e_w = (torch.pow(p, 2) if group["adaptive"] else 1.0) * p.grad * scale.to(p)
                 p.add_(e_w)  # leo len diem co loss cao nhat trong ban kinh rho: w + e(w)
         if zero_grad:
             self.zero_grad()
@@ -38,15 +38,15 @@ class SAM(torch.optim.Optimizer):
             for p in group["params"]:
                 if p.grad is None:
                     continue
-                p.data = self.state[p]["old_p"]  # quay ve w ban dau truoc khi cap nhat
-        self.base_optimizer.step()               # cap nhat w bang gradient tai w + e(w)
+                p.data.copy_(self.state[p]["old_p"])  # copy in-place de giu contiguous memory cho cuDNN LSTM
+        self.base_optimizer.step()                    # cap nhat w bang gradient tai w + e(w)
         if zero_grad:
             self.zero_grad()
 
     def _grad_norm(self):
         shared_device = self.param_groups[0]["params"][0].device
         norms = [
-            p.grad.detach().norm(p=2).to(shared_device)
+            ((torch.abs(p) if group["adaptive"] else 1.0) * p.grad).detach().norm(p=2).to(shared_device)
             for group in self.param_groups
             for p in group["params"]
             if p.grad is not None

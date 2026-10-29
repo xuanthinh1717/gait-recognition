@@ -232,8 +232,8 @@ def main():
                     help="ban kinh cua so truot ff-GEI (2*m+1 frame quanh moi buoc, 0=tat)")
     ap.add_argument("--lstm_layers", type=int, default=1,
                     help="so tang LSTM chong len nhau (mac dinh 1)")
-    ap.add_argument("--optimizer", default="adam", choices=["adam", "sam"],
-                    help="bo toi uu: adam (mac dinh) hoac sam (Sharpness-Aware Minimization)")
+    ap.add_argument("--optimizer", default="adam", choices=["adam", "sam", "asam"],
+                    help="bo toi uu: adam (mac dinh), sam, hoac asam (Adaptive SAM)")
     ap.add_argument("--metric_loss", default="triplet", choices=["triplet", "supcon"],
                     help="ham metric loss khi triplet_weight > 0: triplet (mac dinh) hoac supcon")
     args = ap.parse_args()
@@ -300,14 +300,16 @@ def main():
     base_opt_cls = optim.AdamW if args.weight_decay > 0 else optim.Adam
     opt_kwargs = {"lr": args.lr, "weight_decay": args.weight_decay} if args.weight_decay > 0 else {"lr": args.lr}
     if args.optimizer == "sam":
-        optimizer = SAM(model.parameters(), base_opt_cls, rho=0.05, **opt_kwargs)
+        optimizer = SAM(model.parameters(), base_opt_cls, rho=0.05, adaptive=False, **opt_kwargs)
+    elif args.optimizer == "asam":
+        optimizer = SAM(model.parameters(), base_opt_cls, rho=0.5, adaptive=True, **opt_kwargs)
     else:
         optimizer = base_opt_cls(model.parameters(), **opt_kwargs)
 
     scheduler = None
     warm_iters = int(args.warmup_epochs * len(train_loader))
     if warm_iters > 0:
-        sched_opt = optimizer.base_optimizer if args.optimizer == "sam" else optimizer
+        sched_opt = optimizer.base_optimizer if args.optimizer in ("sam", "asam") else optimizer
         scheduler = optim.lr_scheduler.LambdaLR(
             sched_opt, lambda it: min(1.0, (it + 1) / warm_iters))
 
@@ -331,7 +333,7 @@ def main():
         run_loss, correct, total = 0.0, 0, 0
         for x, y in train_loader:
             x, y = x.to(device), y.to(device)
-            if args.optimizer == "sam":
+            if args.optimizer in ("sam", "asam"):
                 enable_running_stats(model)
                 loss, out, emb = compute_batch_loss(model, x, y, criterion, args)
                 loss.backward()
