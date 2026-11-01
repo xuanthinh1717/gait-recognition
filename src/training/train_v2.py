@@ -234,6 +234,8 @@ def main():
                     help="so tang LSTM chong len nhau (mac dinh 1)")
     ap.add_argument("--optimizer", default="adam", choices=["adam", "sam", "asam"],
                     help="bo toi uu: adam (mac dinh), sam, hoac asam (Adaptive SAM)")
+    ap.add_argument("--rho", type=float, default=None,
+                    help="ban kinh lan can rho cho SAM/ASAM (mac dinh: sam=0.05, asam=0.5)")
     ap.add_argument("--metric_loss", default="triplet", choices=["triplet", "supcon"],
                     help="ham metric loss khi triplet_weight > 0: triplet (mac dinh) hoac supcon")
     args = ap.parse_args()
@@ -246,6 +248,8 @@ def main():
 
     if args.batch_size is None:
         args.batch_size = 128 if args.model == "gei" else 16
+    if args.rho is None and args.optimizer in ("sam", "asam"):
+        args.rho = 0.05 if args.optimizer == "sam" else 0.5
 
     ds_prefix = "oumvlp" if "oumvlp" in args.splits.lower() else "casiab"
     tag = f"{ds_prefix}_{args.model}" + (f"_{args.tag}" if args.tag else "") + f"_seed{args.seed}"
@@ -265,7 +269,7 @@ def main():
                                  "emb_pool", "eval_sample", "triplet_weight",
                                  "triplet_margin", "pk_k", "label_smoothing",
                                  "decay_acc", "min_lr", "ff_gei_m", "lstm_layers",
-                                 "optimizer", "metric_loss")})
+                                 "optimizer", "rho", "metric_loss")})
 
     sp = args.splits
     num_classes = json.load(open(os.path.join(sp, "split_info.json")))["num_train_classes"]
@@ -301,9 +305,9 @@ def main():
     base_opt_cls = optim.AdamW if args.weight_decay > 0 else optim.Adam
     opt_kwargs = {"lr": args.lr, "weight_decay": args.weight_decay} if args.weight_decay > 0 else {"lr": args.lr}
     if args.optimizer == "sam":
-        optimizer = SAM(model.parameters(), base_opt_cls, rho=0.05, adaptive=False, **opt_kwargs)
+        optimizer = SAM(model.parameters(), base_opt_cls, rho=args.rho, adaptive=False, **opt_kwargs)
     elif args.optimizer == "asam":
-        optimizer = SAM(model.parameters(), base_opt_cls, rho=0.5, adaptive=True, **opt_kwargs)
+        optimizer = SAM(model.parameters(), base_opt_cls, rho=args.rho, adaptive=True, **opt_kwargs)
     else:
         optimizer = base_opt_cls(model.parameters(), **opt_kwargs)
 
