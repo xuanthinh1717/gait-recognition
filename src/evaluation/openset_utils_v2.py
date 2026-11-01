@@ -28,7 +28,7 @@ def build_model(name, num_classes, dropout=None, pool="mean", feat_dim=None, lst
 
 def make_dataset(name, csv_file, frames_path, T, train, eval_sample="center", ff_gei_m=0):
     if name == "gei":
-        return GEIDataset(csv_file)
+        return GEIDataset(csv_file, frames_path=frames_path)
     return SeqDataset(csv_file, frames_path=frames_path, T=T, train=train,
                       eval_sample=eval_sample, ff_gei_m=ff_gei_m)
 

@@ -104,7 +104,7 @@ class PKSampler(Sampler):
             chosen = rng.sample(classes, self.p)
             batch = []
             for y in chosen:
-                if len(pools[y]) < self.k:
+                while len(pools[y]) < self.k:
                     buf = list(self.by_label[y])
                     rng.shuffle(buf)
                     pools[y].extend(buf)
@@ -247,7 +247,8 @@ def main():
     if args.batch_size is None:
         args.batch_size = 128 if args.model == "gei" else 16
 
-    tag = f"casiab_{args.model}" + (f"_{args.tag}" if args.tag else "") + f"_seed{args.seed}"
+    ds_prefix = "oumvlp" if "oumvlp" in args.splits.lower() else "casiab"
+    tag = f"{ds_prefix}_{args.model}" + (f"_{args.tag}" if args.tag else "") + f"_seed{args.seed}"
     os.makedirs(args.out_dir, exist_ok=True)
     os.makedirs(args.log_dir, exist_ok=True)
     ckpt_path = os.path.join(args.out_dir, f"{tag}.pth")
@@ -370,9 +371,13 @@ def main():
         res, _ = rank1_openset(val_g.df, g_emb, val_p.df, p_emb)
 
         cur_lr = optimizer.param_groups[0]["lr"]
+        r_nm = res.get("nm", float("nan"))
+        r_bg = res.get("bg", float("nan"))
+        r_cl = res.get("cl", float("nan"))
+        cond_str = (f"NM {r_nm:.1f} BG {r_bg:.1f} CL {r_cl:.1f}"
+                    if "bg" in res or "cl" in res else f"NM {r_nm:.2f}")
         print(f"Epoch [{epoch}/{args.epochs}] lr {cur_lr:.2e} loss {tr_loss:.4f} acc {tr_acc:.2f}% | "
-              f"val Rank-1 NM {res['nm']:.1f} BG {res['bg']:.1f} CL {res['cl']:.1f} "
-              f"mean {res['mean']:.2f}")
+              f"val Rank-1 {cond_str} mean {res['mean']:.2f}")
 
         if args.decay_acc > 0 and decay_start_epoch is None and tr_acc >= args.decay_acc:
             decay_start_epoch = epoch
@@ -388,7 +393,7 @@ def main():
 
         with open(log_path, "a", newline="") as f:
             csv.writer(f).writerow(
-                [epoch, tr_loss, tr_acc, res["nm"], res["bg"], res["cl"], res["mean"]])
+                [epoch, tr_loss, tr_acc, r_nm, r_bg, r_cl, res["mean"]])
 
     print(f"Xong. Best epoch {best_epoch}, val mean Rank-1 {best:.2f} -> {ckpt_path}")
 

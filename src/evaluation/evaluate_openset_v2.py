@@ -91,7 +91,8 @@ def main():
         print(f"\n=== Tong hop {len(runs)} run, model {models.pop()}, split {args.split} ===")
         for k in list(CONDS) + ["mean"]:
             v = np.array([r[k] for _, _, r in runs if k in r])
-            print(f"{k.upper():5s} {v.mean():.2f} +- {v.std(ddof=1):.2f}")
+            if len(v):
+                print(f"{k.upper():5s} {v.mean():.2f} +- {v.std(ddof=1):.2f}")
 
 
 if __name__ == "__main__":

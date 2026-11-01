@@ -84,17 +84,31 @@ class SeqDataset(Dataset):
 
 
 class GEIDataset(Dataset):
-    def __init__(self, csv_file):
+    def __init__(self, csv_file, frames_path=None):
+        import os
         self.df = pd.read_csv(csv_file, dtype=CSV_DTYPES)
         self.paths = self.df["gei_path"].tolist()
         self.labels = self.df["label"].to_numpy()
+        self.npy_idx = self.df["npy_idx"].to_numpy() if "npy_idx" in self.df.columns else None
+        self.frames_path = frames_path
+        self.use_npy = (self.npy_idx is not None and frames_path is not None
+                        and os.path.exists(frames_path))
+        self._frames = None
 
     def __len__(self):
         return len(self.df)
 
+    def _get_frames(self):
+        if self._frames is None:
+            self._frames = np.load(self.frames_path, mmap_mode="r")
+        return self._frames
+
     def __getitem__(self, idx):
-        img = cv2.imread(self.paths[idx], cv2.IMREAD_GRAYSCALE)
-        if img is None:
-            raise FileNotFoundError(self.paths[idx])
-        x = torch.from_numpy(img.astype(np.float32) / 255.0).unsqueeze(0)  # (1, S, S)
+        if self.use_npy:
+            img = self._get_frames()[int(self.npy_idx[idx])]
+        else:
+            img = cv2.imread(self.paths[idx], cv2.IMREAD_GRAYSCALE)
+            if img is None:
+                raise FileNotFoundError(self.paths[idx])
+        x = torch.from_numpy(np.asarray(img, dtype=np.float32) / 255.0).unsqueeze(0)  # (1, S, S)
         return x, torch.tensor(int(self.labels[idx]), dtype=torch.long)
