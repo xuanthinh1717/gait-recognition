@@ -315,6 +315,8 @@ def main():
                     help="so tam con moi lop cho Sub-Center ArcFace (mac dinh 1 = ArcFace chuan)")
     ap.add_argument("--switch_arcface_acc", type=float, default=0.0,
                     help="nguong train_acc (%%) bat dau chuyen sang ArcFace (0 = tat, dung arcface tu dau neu co --arcface)")
+    ap.add_argument("--sophia_k", type=int, default=10,
+                    help="chu ky cap nhat Hessian cua SophiaG (mac dinh 10 buoc)")
     args = ap.parse_args()
 
     if args.tag and not re.fullmatch(r"[A-Za-z0-9]+", args.tag):
@@ -453,7 +455,7 @@ def main():
                 optimizer.step(bs=x.size(0))
                 optimizer.zero_grad()
 
-                if global_step % 10 == 0:
+                if global_step % args.sophia_k == 0:
                     disable_running_stats(model)
                     if active_arcface:
                         emb_h = model.embed(x)
