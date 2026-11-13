@@ -1,10 +1,14 @@
 data/
 outputs/
+outputs_v2/
+outputs_v2_gei/
 logs/
 logs_v2/
 logs_v2_lr1e3
+logs_v2_gei/
 results_v2/
 results_v2_lr1e3
+results_v2_gei/
 __pycache__/
 *.pth
 *.pyc
