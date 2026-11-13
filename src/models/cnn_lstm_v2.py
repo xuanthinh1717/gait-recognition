@@ -109,7 +109,10 @@ class CNNLSTM(nn.Module):
     def forward_steps(self, x, return_embed=False):  # logits tai MOI buoc thoi gian (B, T, C)
         f = self.step_features(x)
         B, T, D = f.shape
-        f_bn = self.bn(f.reshape(B * T, D)).view(B, T, D)
+        f_bn = nn.functional.batch_norm(
+            f.reshape(B * T, D), None, None, self.bn.weight, self.bn.bias,
+            training=True, eps=self.bn.eps
+        ).view(B, T, D)
         steps = self.head(self.drop(f_bn))
         if return_embed:
             pooled = f[:, -1] if self.pool == "last" else f.mean(dim=1)

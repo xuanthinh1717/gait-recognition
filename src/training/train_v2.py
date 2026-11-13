@@ -491,7 +491,7 @@ def main():
         if args.arcface and args.switch_arcface_acc > 0 and not active_arcface and tr_acc >= args.switch_arcface_acc:
             active_arcface = True
             print(f"  -> train_acc {tr_acc:.2f}% >= {args.switch_arcface_acc:.1f}%, "
-                  f"BẬT ArcFace (m={args.arcface_m}, s={args.arcface_s}) tu epoch {epoch + 1}")
+                  f"BAT ArcFace (m={args.arcface_m}, s={args.arcface_s}) tu epoch {epoch + 1}")
 
         # --- validation open-set: embedding + cosine tren nguoi chua tung thay ---
         bs = 64 if args.model == "gei" else 16
