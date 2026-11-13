@@ -25,8 +25,12 @@ Tuy chon moi (MAC DINH TAT, nen ket qua cu van tai tao duoc):
     --min_lr L          lr toi thieu khi giam lr (mac dinh 1e-5)
     --ff_gei_m M        ban kinh cua so truot ff-GEI (2*M+1 frame quanh moi buoc, 0 = frame thuong)
     --lstm_layers N     so tang LSTM chong len nhau (mac dinh 1; bai bao Conv-LSTM dung 3)
-    --optimizer OPT     bo toi uu: adam (mac dinh) hoac sam (Sharpness-Aware Minimization)
+    --optimizer OPT     bo toi uu: adam (mac dinh), sam, hoac asam
     --metric_loss LOSS  ham metric loss khi triplet_weight > 0: triplet (mac dinh) hoac supcon
+    --arcface           dung ArcFace / Sub-Center ArcFace thay cho Linear head thuong
+    --arcface_s S       ban kinh mat cau s cua ArcFace (mac dinh 30.0)
+    --arcface_m M       bien do goc margin m (radian) cua ArcFace (mac dinh 0.35)
+    --arcface_k K       so tam con moi lop cho Sub-Center ArcFace (mac dinh 1 = ArcFace chuan)
 
 Dau ra (khong de len ban cu):
     outputs_v2/casiab_<model>[_<tag>]_seed<N>.pth
@@ -52,6 +56,7 @@ from torch.utils.data import DataLoader, Sampler
 from src.evaluation.openset_utils_v2 import (build_model, extract_embeddings, make_dataset,
                                               rank1_openset)
 from src.training.sam import SAM, disable_running_stats, enable_running_stats
+from src.training.sophia import SophiaG
 
 
 def seed_everything(seed):
@@ -163,25 +168,87 @@ def supcon_loss(emb, y, temperature=0.1):
     return -mean_log_prob_pos.mean()
 
 
-def incremental_loss(model, x, y, label_smoothing=0.0):
+def arcface_logits(emb, weight, y, s=30.0, m=0.35, k=1):
+    """
+    ArcFace / Sub-Center ArcFace (Deng et al., CVPR 2019 / 2020).
+    Chuan hoa L2 ca embedding va trong so lop W, sau do cong bien do goc m (radian)
+    vao goc cua lop nhan dung y: cos(theta_y + m), roi nhan voi ban kinh mat cau s.
+    Neu k > 1 (Sub-Center ArcFace): moi lop co k tam con, lay tam con co cosine lon nhat.
+    """
+    x_norm = F.normalize(emb, p=2, dim=1)
+    w_norm = F.normalize(weight, p=2, dim=1)
+    cosine = F.linear(x_norm, w_norm)
+    if k > 1:
+        cosine = cosine.view(emb.size(0), -1, k).max(dim=2).values
+    cosine = cosine.clamp(-1.0 + 1e-7, 1.0 - 1e-7)
+
+    if m == 0.0:
+        return cosine * s
+
+    cos_m = math.cos(m)
+    sin_m = math.sin(m)
+    th = math.cos(math.pi - m)
+    mm = math.sin(math.pi - m) * m
+
+    sine = torch.sqrt((1.0 - cosine * cosine).clamp(min=1e-12))
+    phi = cosine * cos_m - sine * sin_m
+    phi = torch.where(cosine > th, phi, cosine - mm)
+
+    one_hot = torch.zeros_like(cosine)
+    one_hot.scatter_(1, y.view(-1, 1).long(), 1.0)
+    return ((one_hot * phi) + ((1.0 - one_hot) * cosine)) * s
+
+
+def incremental_loss(model, x, y, label_smoothing=0.0,
+                     arcface=False, arcface_s=30.0, arcface_m=0.35, arcface_k=1):
     """
     Loss tai moi buoc thoi gian t=1..T voi trong so w_t = t^2 (chuan hoa tong = 1).
     Tra ve (loss, logits cua buoc cuoi de tinh accuracy, emb).
     """
-    steps, emb = model.forward_steps(x, return_embed=True)  # (B, T, C), (B, D)
-    B, T, C = steps.shape
+    if arcface:
+        f = model.step_features(x)
+        B, T, D = f.shape
+        f_bn = F.batch_norm(
+            f.reshape(B * T, D), None, None, model.bn.weight, model.bn.bias,
+            training=True, eps=model.bn.eps
+        )
+        y_rep = y.repeat_interleave(T)
+        steps_flat = arcface_logits(f_bn, model.head.weight, y_rep,
+                                    s=arcface_s, m=arcface_m, k=arcface_k)
+        C = steps_flat.size(1)
+        steps = steps_flat.view(B, T, C)
+        pooled = f[:, -1] if model.pool == "last" else f.mean(dim=1)
+        emb = model.bn(pooled)
+    else:
+        steps, emb = model.forward_steps(x, return_embed=True)  # (B, T, C), (B, D)
+        B, T, C = steps.shape
+        y_rep = y.repeat_interleave(T)
+        steps_flat = steps.reshape(B * T, C)
+
     w = torch.arange(1, T + 1, device=x.device, dtype=steps.dtype) ** 2
     w = w / w.sum()
-    ce = F.cross_entropy(steps.reshape(B * T, C), y.repeat_interleave(T),
+    ce = F.cross_entropy(steps_flat, y_rep,
                          reduction="none", label_smoothing=label_smoothing).view(B, T)
     return (ce * w).sum(dim=1).mean(), steps[:, -1], emb
 
 
-def compute_batch_loss(model, x, y, criterion, args):
+def compute_batch_loss(model, x, y, criterion, args, active_arcface=None):
+    use_arcface = args.arcface if active_arcface is None else active_arcface
     if args.incremental_loss:
-        loss, out, emb = incremental_loss(model, x, y, args.label_smoothing)
+        loss, out, emb = incremental_loss(
+            model, x, y, args.label_smoothing,
+            arcface=use_arcface, arcface_s=args.arcface_s,
+            arcface_m=args.arcface_m, arcface_k=args.arcface_k,
+        )
+    elif use_arcface:
+        emb = model.embed(x)
+        out = arcface_logits(emb, model.head.weight, y,
+                             s=args.arcface_s, m=args.arcface_m, k=args.arcface_k)
+        loss = criterion(out, y)
     else:
         out, emb = model(x, return_embed=True)
+        if args.arcface and args.arcface_k > 1:
+            out = out.view(out.size(0), -1, args.arcface_k).max(dim=2).values
         loss = criterion(out, y)
     if args.triplet_weight > 0:
         if args.metric_loss == "supcon":
@@ -232,12 +299,22 @@ def main():
                     help="ban kinh cua so truot ff-GEI (2*m+1 frame quanh moi buoc, 0=tat)")
     ap.add_argument("--lstm_layers", type=int, default=1,
                     help="so tang LSTM chong len nhau (mac dinh 1)")
-    ap.add_argument("--optimizer", default="adam", choices=["adam", "sam", "asam"],
-                    help="bo toi uu: adam (mac dinh), sam, hoac asam (Adaptive SAM)")
+    ap.add_argument("--optimizer", default="adam", choices=["adam", "sam", "asam", "sophia"],
+                    help="bo toi uu: adam (mac dinh), sam, asam, hoac sophia (Sophia-G ICLR 2024)")
     ap.add_argument("--rho", type=float, default=None,
-                    help="ban kinh lan can rho cho SAM/ASAM (mac dinh: sam=0.05, asam=0.5)")
+                    help="ban kinh rho cho SAM/ASAM/Sophia (mac dinh: sam=0.05, asam=0.5, sophia=0.04)")
     ap.add_argument("--metric_loss", default="triplet", choices=["triplet", "supcon"],
                     help="ham metric loss khi triplet_weight > 0: triplet (mac dinh) hoac supcon")
+    ap.add_argument("--arcface", action="store_true",
+                    help="dung ArcFace / Sub-Center ArcFace thay cho Linear head thuong")
+    ap.add_argument("--arcface_s", type=float, default=30.0,
+                    help="he so scale s (ban kinh mat cau) cua ArcFace (mac dinh 30.0)")
+    ap.add_argument("--arcface_m", type=float, default=0.35,
+                    help="bien do goc margin m (radian) cua ArcFace (mac dinh 0.35)")
+    ap.add_argument("--arcface_k", type=int, default=1,
+                    help="so tam con moi lop cho Sub-Center ArcFace (mac dinh 1 = ArcFace chuan)")
+    ap.add_argument("--switch_arcface_acc", type=float, default=0.0,
+                    help="nguong train_acc (%%) bat dau chuyen sang ArcFace (0 = tat, dung arcface tu dau neu co --arcface)")
     args = ap.parse_args()
 
     if args.tag and not re.fullmatch(r"[A-Za-z0-9]+", args.tag):
@@ -245,11 +322,13 @@ def main():
     if args.model != "lstm" and (args.incremental_loss or args.emb_pool != "mean"
                                  or args.lstm_layers != 1):
         sys.exit("--incremental_loss, --emb_pool last, --lstm_layers chi dung voi --model lstm.")
+    if args.arcface_k < 1:
+        sys.exit("--arcface_k phai >= 1.")
 
     if args.batch_size is None:
         args.batch_size = 128 if args.model == "gei" else 16
-    if args.rho is None and args.optimizer in ("sam", "asam"):
-        args.rho = 0.05 if args.optimizer == "sam" else 0.5
+    if args.rho is None and args.optimizer in ("sam", "asam", "sophia"):
+        args.rho = {"sam": 0.05, "asam": 0.5, "sophia": 0.04}[args.optimizer]
 
     ds_prefix = "oumvlp" if "oumvlp" in args.splits.lower() else "casiab"
     tag = f"{ds_prefix}_{args.model}" + (f"_{args.tag}" if args.tag else "") + f"_seed{args.seed}"
@@ -269,7 +348,8 @@ def main():
                                  "emb_pool", "eval_sample", "triplet_weight",
                                  "triplet_margin", "pk_k", "label_smoothing",
                                  "decay_acc", "min_lr", "ff_gei_m", "lstm_layers",
-                                 "optimizer", "rho", "metric_loss")})
+                                 "optimizer", "rho", "metric_loss",
+                                 "arcface", "arcface_s", "arcface_m", "arcface_k")})
 
     sp = args.splits
     num_classes = json.load(open(os.path.join(sp, "split_info.json")))["num_train_classes"]
@@ -298,8 +378,11 @@ def main():
             pin_memory=(device.type == "cuda"),
         )
 
-    model = build_model(args.model, num_classes, args.dropout, args.emb_pool,
+    head_classes = num_classes * args.arcface_k if args.arcface else num_classes
+    model = build_model(args.model, head_classes, args.dropout, args.emb_pool,
                         feat_dim=args.feat_dim, lstm_layers=args.lstm_layers).to(device)
+    if args.arcface and model.head.bias is not None:
+        model.head.bias.requires_grad_(False)
     print("Tham so:", sum(p.numel() for p in model.parameters()))
     criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
     base_opt_cls = optim.AdamW if args.weight_decay > 0 else optim.Adam
@@ -308,6 +391,9 @@ def main():
         optimizer = SAM(model.parameters(), base_opt_cls, rho=args.rho, adaptive=False, **opt_kwargs)
     elif args.optimizer == "asam":
         optimizer = SAM(model.parameters(), base_opt_cls, rho=args.rho, adaptive=True, **opt_kwargs)
+    elif args.optimizer == "sophia":
+        optimizer = SophiaG(model.parameters(), lr=args.lr, rho=args.rho,
+                            weight_decay=args.weight_decay)
     else:
         optimizer = base_opt_cls(model.parameters(), **opt_kwargs)
 
@@ -325,6 +411,8 @@ def main():
     best = -1.0
     best_epoch = 0
     decay_start_epoch = None
+    global_step = 0
+    active_arcface = args.arcface and (args.switch_arcface_acc == 0.0)
     for epoch in range(1, args.epochs + 1):
         if decay_start_epoch is not None:
             scheduler = None
@@ -340,21 +428,53 @@ def main():
             x, y = x.to(device), y.to(device)
             if args.optimizer in ("sam", "asam"):
                 enable_running_stats(model)
-                loss, out, emb = compute_batch_loss(model, x, y, criterion, args)
+                loss, out, emb = compute_batch_loss(model, x, y, criterion, args,
+                                                    active_arcface=active_arcface)
                 loss.backward()
                 if args.clip_grad > 0:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
                 optimizer.first_step(zero_grad=True)
 
                 disable_running_stats(model)
-                loss2, _, _ = compute_batch_loss(model, x, y, criterion, args)
+                loss2, _, _ = compute_batch_loss(model, x, y, criterion, args,
+                                                 active_arcface=active_arcface)
                 loss2.backward()
                 if args.clip_grad > 0:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
                 optimizer.second_step(zero_grad=True)
+            elif args.optimizer == "sophia":
+                enable_running_stats(model)
+                optimizer.zero_grad()
+                loss, out, emb = compute_batch_loss(model, x, y, criterion, args,
+                                                    active_arcface=active_arcface)
+                loss.backward()
+                if args.clip_grad > 0:
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
+                optimizer.step(bs=x.size(0))
+                optimizer.zero_grad()
+
+                if global_step % 10 == 0:
+                    disable_running_stats(model)
+                    if active_arcface:
+                        emb_h = model.embed(x)
+                        out_h = arcface_logits(emb_h, model.head.weight, y,
+                                               s=args.arcface_s, m=0.0, k=args.arcface_k)
+                    else:
+                        out_h = model(x)
+                        if args.arcface and args.arcface_k > 1:
+                            out_h = out_h.view(out_h.size(0), -1, args.arcface_k).max(dim=2).values
+                    with torch.no_grad():
+                        y_hat = torch.distributions.Categorical(logits=out_h.detach()).sample()
+                    loss_h = F.cross_entropy(out_h, y_hat)
+                    loss_h.backward()
+                    optimizer.update_hessian()
+                    optimizer.zero_grad()
+                    enable_running_stats(model)
+                global_step += 1
             else:
                 optimizer.zero_grad()
-                loss, out, emb = compute_batch_loss(model, x, y, criterion, args)
+                loss, out, emb = compute_batch_loss(model, x, y, criterion, args,
+                                                    active_arcface=active_arcface)
                 loss.backward()
                 if args.clip_grad > 0:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
@@ -367,6 +487,11 @@ def main():
             total += y.size(0)
         tr_loss = run_loss / max(1, len(train_loader))
         tr_acc = 100 * correct / max(1, total)
+
+        if args.arcface and args.switch_arcface_acc > 0 and not active_arcface and tr_acc >= args.switch_arcface_acc:
+            active_arcface = True
+            print(f"  -> train_acc {tr_acc:.2f}% >= {args.switch_arcface_acc:.1f}%, "
+                  f"BẬT ArcFace (m={args.arcface_m}, s={args.arcface_s}) tu epoch {epoch + 1}")
 
         # --- validation open-set: embedding + cosine tren nguoi chua tung thay ---
         bs = 64 if args.model == "gei" else 16

@@ -25,7 +25,8 @@ from src.evaluation.openset_utils_v2 import (CONDS, build_model, extract_embeddi
 def evaluate(ckpt_path, split, splits_dir, frames, device, num_workers):
     ck = torch.load(ckpt_path, map_location=device)
     a = ck["args"]
-    model = build_model(a["model"], ck["num_classes"], a["dropout"],
+    head_classes = ck["num_classes"] * a.get("arcface_k", 1) if a.get("arcface") else ck["num_classes"]
+    model = build_model(a["model"], head_classes, a["dropout"],
                         pool=a.get("emb_pool", "mean"),
                         feat_dim=a.get("feat_dim", None),
                         lstm_layers=a.get("lstm_layers", 1)).to(device)
