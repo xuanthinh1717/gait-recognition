@@ -12,34 +12,45 @@ from torch.nn.modules.batchnorm import _BatchNorm
 class SAM(torch.optim.Optimizer):
     def __init__(self, params, base_optimizer, rho=0.05, adaptive=False, **kwargs):
         assert rho >= 0.0, f"Invalid rho, should be non-negative: {rho}"
-        defaults = dict(rho=rho, adaptive=adaptive, **kwargs)
+        base_rho = kwargs.pop("base_rho", None)
+        defaults = dict(rho=rho, sam_rho=rho, adaptive=adaptive, **kwargs)
         super().__init__(params, defaults)
+        if base_rho is not None:
+            kwargs["rho"] = base_rho
         self.base_optimizer = base_optimizer(self.param_groups, **kwargs)
         self.param_groups = self.base_optimizer.param_groups
+        for group in self.param_groups:
+            group["sam_rho"] = rho
+            group["adaptive"] = adaptive
+            if base_rho is not None:
+                group["rho"] = base_rho
         self.defaults.update(self.base_optimizer.defaults)
 
     @torch.no_grad()
     def first_step(self, zero_grad=False):
+        if hasattr(self.base_optimizer, "update_ef_hessian"):
+            self.base_optimizer.update_ef_hessian()
         grad_norm = self._grad_norm()
         for group in self.param_groups:
-            scale = group["rho"] / (grad_norm + 1e-12)
+            sam_rho = group.get("sam_rho", group["rho"])
+            scale = sam_rho / (grad_norm + 1e-12)
             for p in group["params"]:
                 if p.grad is None:
                     continue
                 self.state[p]["old_p"] = p.data.clone()
                 e_w = (torch.pow(p, 2) if group["adaptive"] else 1.0) * p.grad * scale.to(p)
-                p.add_(e_w)  # leo len diem co loss cao nhat trong ban kinh rho: w + e(w)
+                p.add_(e_w)  # leo len diem co loss cao nhat trong ban kinh sam_rho: w + e(w)
         if zero_grad:
             self.zero_grad()
 
     @torch.no_grad()
-    def second_step(self, zero_grad=False):
+    def second_step(self, zero_grad=False, **step_kwargs):
         for group in self.param_groups:
             for p in group["params"]:
                 if p.grad is None:
                     continue
                 p.data.copy_(self.state[p]["old_p"])  # copy in-place de giu contiguous memory cho cuDNN LSTM
-        self.base_optimizer.step()                    # cap nhat w bang gradient tai w + e(w)
+        self.base_optimizer.step(**step_kwargs)       # cap nhat w bang gradient tai w + e(w)
         if zero_grad:
             self.zero_grad()
 

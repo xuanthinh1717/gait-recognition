@@ -168,12 +168,14 @@ def supcon_loss(emb, y, temperature=0.1):
     return -mean_log_prob_pos.mean()
 
 
-def arcface_logits(emb, weight, y, s=30.0, m=0.35, k=1):
+def arcface_logits(emb, weight, y, s=30.0, m=0.35, k=1, return_clean=False):
     """
     ArcFace / Sub-Center ArcFace (Deng et al., CVPR 2019 / 2020).
     Chuan hoa L2 ca embedding va trong so lop W, sau do cong bien do goc m (radian)
     vao goc cua lop nhan dung y: cos(theta_y + m), roi nhan voi ban kinh mat cau s.
     Neu k > 1 (Sub-Center ArcFace): moi lop co k tam con, lay tam con co cosine lon nhat.
+    Neu return_clean=True: tra ve (logits_co_margin, clean_cosine_logits) de tinh train_acc
+    trung thuc tren mat cau ma khong bi bien do m lamlech nguong decay_acc.
     """
     x_norm = F.normalize(emb, p=2, dim=1)
     w_norm = F.normalize(weight, p=2, dim=1)
@@ -181,9 +183,10 @@ def arcface_logits(emb, weight, y, s=30.0, m=0.35, k=1):
     if k > 1:
         cosine = cosine.view(emb.size(0), -1, k).max(dim=2).values
     cosine = cosine.clamp(-1.0 + 1e-7, 1.0 - 1e-7)
+    clean_logits = cosine * s
 
     if m == 0.0:
-        return cosine * s
+        return (clean_logits, clean_logits) if return_clean else clean_logits
 
     cos_m = math.cos(m)
     sin_m = math.sin(m)
@@ -196,7 +199,42 @@ def arcface_logits(emb, weight, y, s=30.0, m=0.35, k=1):
 
     one_hot = torch.zeros_like(cosine)
     one_hot.scatter_(1, y.view(-1, 1).long(), 1.0)
-    return ((one_hot * phi) + ((1.0 - one_hot) * cosine)) * s
+    logits = ((one_hot * phi) + ((1.0 - one_hot) * cosine)) * s
+    return (logits, clean_logits) if return_clean else logits
+
+
+class ModelEMA:
+    """
+    Exponential Moving Average (EMA) cua trong so mo hinh.
+    Lam muot quy dao cap nhat o day cuc tieu (dac biet hieu qua voi Sophia va SAM).
+    """
+
+    def __init__(self, model, decay=0.995):
+        self.decay = decay
+        self.num_updates = 0
+        self.shadow = {k: v.detach().clone() for k, v in model.state_dict().items()}
+        self.backup = {}
+
+    @torch.no_grad()
+    def update(self, model):
+        self.num_updates += 1
+        d = min(self.decay, (1.0 + self.num_updates) / (10.0 + self.num_updates))
+        for k, v in model.state_dict().items():
+            if v.dtype.is_floating_point:
+                self.shadow[k].mul_(d).add_(v.detach(), alpha=1.0 - d)
+            else:
+                self.shadow[k].copy_(v)
+
+    @torch.no_grad()
+    def apply_shadow(self, model):
+        self.backup = {k: v.detach().clone() for k, v in model.state_dict().items()}
+        model.load_state_dict(self.shadow, strict=True)
+
+    @torch.no_grad()
+    def restore(self, model):
+        if self.backup:
+            model.load_state_dict(self.backup, strict=True)
+            self.backup = {}
 
 
 def incremental_loss(model, x, y, label_smoothing=0.0,
@@ -213,14 +251,18 @@ def incremental_loss(model, x, y, label_smoothing=0.0,
             training=True, eps=model.bn.eps
         )
         y_rep = y.repeat_interleave(T)
-        steps_flat = arcface_logits(f_bn, model.head.weight, y_rep,
-                                    s=arcface_s, m=arcface_m, k=arcface_k)
+        steps_flat, clean_flat = arcface_logits(
+            f_bn, model.head.weight, y_rep,
+            s=arcface_s, m=arcface_m, k=arcface_k, return_clean=True
+        )
         C = steps_flat.size(1)
         steps = steps_flat.view(B, T, C)
+        clean_steps = clean_flat.view(B, T, C)
         pooled = f[:, -1] if model.pool == "last" else f.mean(dim=1)
         emb = model.bn(pooled)
     else:
         steps, emb = model.forward_steps(x, return_embed=True)  # (B, T, C), (B, D)
+        clean_steps = steps
         B, T, C = steps.shape
         y_rep = y.repeat_interleave(T)
         steps_flat = steps.reshape(B * T, C)
@@ -229,26 +271,30 @@ def incremental_loss(model, x, y, label_smoothing=0.0,
     w = w / w.sum()
     ce = F.cross_entropy(steps_flat, y_rep,
                          reduction="none", label_smoothing=label_smoothing).view(B, T)
-    return (ce * w).sum(dim=1).mean(), steps[:, -1], emb
+    return (ce * w).sum(dim=1).mean(), clean_steps[:, -1], emb
 
 
-def compute_batch_loss(model, x, y, criterion, args, active_arcface=None):
+def compute_batch_loss(model, x, y, criterion, args, active_arcface=None, cur_m=None):
     use_arcface = args.arcface if active_arcface is None else active_arcface
+    m_val = (args.arcface_m if cur_m is None else cur_m) if use_arcface else 0.0
     if args.incremental_loss:
         loss, out, emb = incremental_loss(
             model, x, y, args.label_smoothing,
-            arcface=use_arcface, arcface_s=args.arcface_s,
-            arcface_m=args.arcface_m, arcface_k=args.arcface_k,
+            arcface=args.arcface, arcface_s=args.arcface_s,
+            arcface_m=m_val, arcface_k=args.arcface_k,
         )
-    elif use_arcface:
+    elif args.arcface:
+        # Luon nam tren mat cau Cosine L2 ngay tu Epoch 1 (m=0.0 truoc khi switch)
+        # de tranh cu soc hinh hoc (Geometry Shock) khi chuyen pha sang ArcFace.
         emb = model.embed(x)
-        out = arcface_logits(emb, model.head.weight, y,
-                             s=args.arcface_s, m=args.arcface_m, k=args.arcface_k)
-        loss = criterion(out, y)
+        logits, clean_out = arcface_logits(
+            emb, model.head.weight, y,
+            s=args.arcface_s, m=m_val, k=args.arcface_k, return_clean=True
+        )
+        loss = criterion(logits, y)
+        out = clean_out
     else:
         out, emb = model(x, return_embed=True)
-        if args.arcface and args.arcface_k > 1:
-            out = out.view(out.size(0), -1, args.arcface_k).max(dim=2).values
         loss = criterion(out, y)
     if args.triplet_weight > 0:
         if args.metric_loss == "supcon":
@@ -299,10 +345,13 @@ def main():
                     help="ban kinh cua so truot ff-GEI (2*m+1 frame quanh moi buoc, 0=tat)")
     ap.add_argument("--lstm_layers", type=int, default=1,
                     help="so tang LSTM chong len nhau (mac dinh 1)")
-    ap.add_argument("--optimizer", default="adam", choices=["adam", "sam", "asam", "sophia"],
-                    help="bo toi uu: adam (mac dinh), sam, asam, hoac sophia (Sophia-G ICLR 2024)")
+    ap.add_argument("--optimizer", default="adam",
+                    choices=["adam", "sam", "asam", "sophia", "samsophia", "asamsophia"],
+                    help="bo toi uu: adam (mac dinh), sam, asam, sophia, samsophia, hoac asamsophia")
     ap.add_argument("--rho", type=float, default=None,
-                    help="ban kinh rho cho SAM/ASAM/Sophia (mac dinh: sam=0.05, asam=0.5, sophia=0.04)")
+                    help="ban kinh rho cho SAM/ASAM/Sophia (mac dinh: sam=0.05, asam=0.5, sophia=0.04, samsophia=0.02)")
+    ap.add_argument("--sam_rho", type=float, default=None,
+                    help="ban kinh nhieu SAM khi dung samsophia/asamsophia (mac dinh: samsophia=0.05, asamsophia=0.5)")
     ap.add_argument("--metric_loss", default="triplet", choices=["triplet", "supcon"],
                     help="ham metric loss khi triplet_weight > 0: triplet (mac dinh) hoac supcon")
     ap.add_argument("--arcface", action="store_true",
@@ -315,8 +364,14 @@ def main():
                     help="so tam con moi lop cho Sub-Center ArcFace (mac dinh 1 = ArcFace chuan)")
     ap.add_argument("--switch_arcface_acc", type=float, default=0.0,
                     help="nguong train_acc (%%) bat dau chuyen sang ArcFace (0 = tat, dung arcface tu dau neu co --arcface)")
+    ap.add_argument("--arcface_warmup", type=float, default=0.0,
+                    help="so epoch tang dan bien do goc m tu 0 -> arcface_m (0 = bat ngay m)")
     ap.add_argument("--sophia_k", type=int, default=10,
                     help="chu ky cap nhat Hessian cua SophiaG (mac dinh 10 buoc)")
+    ap.add_argument("--sophia_ef", type=float, default=0.0,
+                    help="ty trong pha tron do cong Empirical Fisher toan phan (CE+Triplet) vao Sophia [0..1]")
+    ap.add_argument("--ema_decay", type=float, default=0.0,
+                    help="he so lam muot trong so Model EMA (vd 0.995; 0 = tat)")
     args = ap.parse_args()
 
     if args.tag and not re.fullmatch(r"[A-Za-z0-9]+", args.tag):
@@ -329,8 +384,11 @@ def main():
 
     if args.batch_size is None:
         args.batch_size = 128 if args.model == "gei" else 16
-    if args.rho is None and args.optimizer in ("sam", "asam", "sophia"):
-        args.rho = {"sam": 0.05, "asam": 0.5, "sophia": 0.04}[args.optimizer]
+    if args.rho is None and args.optimizer in ("sam", "asam", "sophia", "samsophia", "asamsophia"):
+        args.rho = {
+            "sam": 0.05, "asam": 0.5, "sophia": 0.04,
+            "samsophia": 0.02, "asamsophia": 0.02,
+        }[args.optimizer]
 
     ds_prefix = "oumvlp" if "oumvlp" in args.splits.lower() else "casiab"
     tag = f"{ds_prefix}_{args.model}" + (f"_{args.tag}" if args.tag else "") + f"_seed{args.seed}"
@@ -350,8 +408,10 @@ def main():
                                  "emb_pool", "eval_sample", "triplet_weight",
                                  "triplet_margin", "pk_k", "label_smoothing",
                                  "decay_acc", "min_lr", "ff_gei_m", "lstm_layers",
-                                 "optimizer", "rho", "metric_loss",
-                                 "arcface", "arcface_s", "arcface_m", "arcface_k")})
+                                 "optimizer", "rho", "sam_rho", "metric_loss",
+                                 "arcface", "arcface_s", "arcface_m", "arcface_k",
+                                 "switch_arcface_acc", "arcface_warmup",
+                                 "sophia_k", "sophia_ef", "ema_decay")})
 
     sp = args.splits
     num_classes = json.load(open(os.path.join(sp, "split_info.json")))["num_train_classes"]
@@ -395,14 +455,26 @@ def main():
         optimizer = SAM(model.parameters(), base_opt_cls, rho=args.rho, adaptive=True, **opt_kwargs)
     elif args.optimizer == "sophia":
         optimizer = SophiaG(model.parameters(), lr=args.lr, rho=args.rho,
-                            weight_decay=args.weight_decay)
+                            weight_decay=args.weight_decay, ef_weight=args.sophia_ef)
+    elif args.optimizer in ("samsophia", "asamsophia"):
+        is_adaptive = (args.optimizer == "asamsophia")
+        sam_rho = args.sam_rho if args.sam_rho is not None else (0.5 if is_adaptive else 0.05)
+        ef_w = args.sophia_ef if args.sophia_ef > 0.0 else 1.0
+        optimizer = SAM(
+            model.parameters(), SophiaG, rho=sam_rho, adaptive=is_adaptive,
+            base_rho=args.rho, lr=args.lr, weight_decay=args.weight_decay, ef_weight=ef_w,
+        )
     else:
         optimizer = base_opt_cls(model.parameters(), **opt_kwargs)
+
+    ema = ModelEMA(model, decay=args.ema_decay) if args.ema_decay > 0.0 else None
 
     scheduler = None
     warm_iters = int(args.warmup_epochs * len(train_loader))
     if warm_iters > 0:
-        sched_opt = optimizer.base_optimizer if args.optimizer in ("sam", "asam") else optimizer
+        sched_opt = (optimizer.base_optimizer
+                     if args.optimizer in ("sam", "asam", "samsophia", "asamsophia")
+                     else optimizer)
         scheduler = optim.lr_scheduler.LambdaLR(
             sched_opt, lambda it: min(1.0, (it + 1) / warm_iters))
 
@@ -415,6 +487,7 @@ def main():
     decay_start_epoch = None
     global_step = 0
     active_arcface = args.arcface and (args.switch_arcface_acc == 0.0)
+    arcface_start_epoch = 1 if active_arcface else None
     for epoch in range(1, args.epochs + 1):
         if decay_start_epoch is not None:
             scheduler = None
@@ -424,14 +497,23 @@ def main():
             for pg in optimizer.param_groups:
                 pg["lr"] = cur_lr
 
+        if active_arcface:
+            if args.arcface_warmup > 0 and arcface_start_epoch is not None:
+                m_prog = min(1.0, (epoch - arcface_start_epoch + 1) / args.arcface_warmup)
+                cur_m = args.arcface_m * m_prog
+            else:
+                cur_m = args.arcface_m
+        else:
+            cur_m = 0.0
+
         model.train()
         run_loss, correct, total = 0.0, 0, 0
         for x, y in train_loader:
             x, y = x.to(device), y.to(device)
-            if args.optimizer in ("sam", "asam"):
+            if args.optimizer in ("sam", "asam", "samsophia", "asamsophia"):
                 enable_running_stats(model)
                 loss, out, emb = compute_batch_loss(model, x, y, criterion, args,
-                                                    active_arcface=active_arcface)
+                                                    active_arcface=active_arcface, cur_m=cur_m)
                 loss.backward()
                 if args.clip_grad > 0:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
@@ -439,32 +521,33 @@ def main():
 
                 disable_running_stats(model)
                 loss2, _, _ = compute_batch_loss(model, x, y, criterion, args,
-                                                 active_arcface=active_arcface)
+                                                 active_arcface=active_arcface, cur_m=cur_m)
                 loss2.backward()
                 if args.clip_grad > 0:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
-                optimizer.second_step(zero_grad=True)
+                if args.optimizer in ("samsophia", "asamsophia"):
+                    optimizer.second_step(zero_grad=True, bs=x.size(0))
+                else:
+                    optimizer.second_step(zero_grad=True)
             elif args.optimizer == "sophia":
                 enable_running_stats(model)
                 optimizer.zero_grad()
                 loss, out, emb = compute_batch_loss(model, x, y, criterion, args,
-                                                    active_arcface=active_arcface)
+                                                    active_arcface=active_arcface, cur_m=cur_m)
                 loss.backward()
                 if args.clip_grad > 0:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
                 optimizer.step(bs=x.size(0))
                 optimizer.zero_grad()
 
-                if global_step % args.sophia_k == 0:
+                if args.sophia_ef < 1.0 and global_step % args.sophia_k == 0:
                     disable_running_stats(model)
-                    if active_arcface:
+                    if args.arcface:
                         emb_h = model.embed(x)
                         out_h = arcface_logits(emb_h, model.head.weight, y,
                                                s=args.arcface_s, m=0.0, k=args.arcface_k)
                     else:
                         out_h = model(x)
-                        if args.arcface and args.arcface_k > 1:
-                            out_h = out_h.view(out_h.size(0), -1, args.arcface_k).max(dim=2).values
                     with torch.no_grad():
                         y_hat = torch.distributions.Categorical(logits=out_h.detach()).sample()
                     loss_h = F.cross_entropy(out_h, y_hat)
@@ -476,12 +559,14 @@ def main():
             else:
                 optimizer.zero_grad()
                 loss, out, emb = compute_batch_loss(model, x, y, criterion, args,
-                                                    active_arcface=active_arcface)
+                                                    active_arcface=active_arcface, cur_m=cur_m)
                 loss.backward()
                 if args.clip_grad > 0:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
                 optimizer.step()
 
+            if ema is not None:
+                ema.update(model)
             if scheduler is not None:
                 scheduler.step()
             run_loss += loss.item()
@@ -492,10 +577,13 @@ def main():
 
         if args.arcface and args.switch_arcface_acc > 0 and not active_arcface and tr_acc >= args.switch_arcface_acc:
             active_arcface = True
+            arcface_start_epoch = epoch + 1
             print(f"  -> train_acc {tr_acc:.2f}% >= {args.switch_arcface_acc:.1f}%, "
-                  f"BAT ArcFace (m={args.arcface_m}, s={args.arcface_s}) tu epoch {epoch + 1}")
+                  f"BAT ArcFace (m={args.arcface_m}, s={args.arcface_s}, warmup={args.arcface_warmup}) tu epoch {epoch + 1}")
 
         # --- validation open-set: embedding + cosine tren nguoi chua tung thay ---
+        if ema is not None:
+            ema.apply_shadow(model)
         bs = 64 if args.model == "gei" else 16
         g_emb = extract_embeddings(model, val_g, device, bs, args.num_workers)
         p_emb = extract_embeddings(model, val_p, device, bs, args.num_workers)
@@ -507,7 +595,8 @@ def main():
         r_cl = res.get("cl", float("nan"))
         cond_str = (f"NM {r_nm:.1f} BG {r_bg:.1f} CL {r_cl:.1f}"
                     if "bg" in res or "cl" in res else f"NM {r_nm:.2f}")
-        print(f"Epoch [{epoch}/{args.epochs}] lr {cur_lr:.2e} loss {tr_loss:.4f} acc {tr_acc:.2f}% | "
+        m_str = f" m={cur_m:.3f}" if args.arcface else ""
+        print(f"Epoch [{epoch}/{args.epochs}] lr {cur_lr:.2e}{m_str} loss {tr_loss:.4f} acc {tr_acc:.2f}% | "
               f"val Rank-1 {cond_str} mean {res['mean']:.2f}")
 
         if args.decay_acc > 0 and decay_start_epoch is None and tr_acc >= args.decay_acc:
@@ -521,6 +610,9 @@ def main():
                         "num_classes": num_classes, "epoch": epoch,
                         "val_mean": best}, ckpt_path)
             print(f"  -> saved (best val mean Rank-1 {best:.2f})")
+
+        if ema is not None:
+            ema.restore(model)
 
         with open(log_path, "a", newline="") as f:
             csv.writer(f).writerow(
