@@ -28,8 +28,7 @@ class SAM(torch.optim.Optimizer):
 
     @torch.no_grad()
     def first_step(self, zero_grad=False):
-        if hasattr(self.base_optimizer, "update_ef_hessian"):
-            self.base_optimizer.update_ef_hessian()
+        has_sophia = hasattr(self.base_optimizer, "update_param_hessian")
         grad_norm = self._grad_norm()
         for group in self.param_groups:
             sam_rho = group.get("sam_rho", group["rho"])
@@ -38,6 +37,8 @@ class SAM(torch.optim.Optimizer):
                 if p.grad is None:
                     continue
                 self.state[p]["old_p"] = p.data.clone()
+                if has_sophia:
+                    self.state[p]["old_g"] = p.grad.detach().clone()
                 e_w = (torch.pow(p, 2) if group["adaptive"] else 1.0) * p.grad * scale.to(p)
                 p.add_(e_w)  # leo len diem co loss cao nhat trong ban kinh sam_rho: w + e(w)
         if zero_grad:
@@ -45,11 +46,16 @@ class SAM(torch.optim.Optimizer):
 
     @torch.no_grad()
     def second_step(self, zero_grad=False, **step_kwargs):
+        has_sophia = hasattr(self.base_optimizer, "update_param_hessian")
         for group in self.param_groups:
             for p in group["params"]:
                 if p.grad is None:
                     continue
                 p.data.copy_(self.state[p]["old_p"])  # copy in-place de giu contiguous memory cho cuDNN LSTM
+                if has_sophia and "old_g" in self.state[p]:
+                    self.base_optimizer.update_param_hessian(
+                        p, p.grad.detach() - self.state[p]["old_g"]
+                    )
         self.base_optimizer.step(**step_kwargs)       # cap nhat w bang gradient tai w + e(w)
         if zero_grad:
             self.zero_grad()

@@ -280,12 +280,29 @@ def compute_batch_loss(model, x, y, criterion, args, active_arcface=None, cur_m=
     if args.incremental_loss:
         loss, out, emb = incremental_loss(
             model, x, y, args.label_smoothing,
-            arcface=args.arcface, arcface_s=args.arcface_s,
+            arcface=use_arcface, arcface_s=args.arcface_s,
             arcface_m=m_val, arcface_k=args.arcface_k,
         )
-    elif args.arcface:
-        # Luon nam tren mat cau Cosine L2 ngay tu Epoch 1 (m=0.0 truoc khi switch)
-        # de tranh cu soc hinh hoc (Geometry Shock) khi chuyen pha sang ArcFace.
+    elif args.arcface and (args.switch_arcface_acc > 0 or args.arcface_warmup > 0):
+        # Smooth Sub-Center Curriculum: Giu nhánh Linear Sub-Center (co Dropout + tu do norm)
+        # va pha tron muot voi nhánh Angular Margin ArcFace sau khi switch de khong bi soc hinh hoc hay overfit.
+        out_lin, emb = model(x, return_embed=True)
+        if args.arcface_k > 1:
+            out_lin = out_lin.view(out_lin.size(0), -1, args.arcface_k).max(dim=2).values
+        loss_lin = criterion(out_lin, y)
+        if use_arcface and m_val > 0.0:
+            logits_arc = arcface_logits(
+                emb, model.head.weight, y,
+                s=args.arcface_s, m=m_val, k=args.arcface_k, return_clean=False
+            )
+            loss_arc = criterion(logits_arc, y)
+            prog = min(1.0, m_val / max(args.arcface_m, 1e-6))
+            w_arc = 0.15 * prog
+            loss = (1.0 - w_arc) * loss_lin + w_arc * loss_arc
+        else:
+            loss = loss_lin
+        out = out_lin
+    elif use_arcface:
         emb = model.embed(x)
         logits, clean_out = arcface_logits(
             emb, model.head.weight, y,
@@ -295,6 +312,8 @@ def compute_batch_loss(model, x, y, criterion, args, active_arcface=None, cur_m=
         out = clean_out
     else:
         out, emb = model(x, return_embed=True)
+        if args.arcface and args.arcface_k > 1:
+            out = out.view(out.size(0), -1, args.arcface_k).max(dim=2).values
         loss = criterion(out, y)
     if args.triplet_weight > 0:
         if args.metric_loss == "supcon":
@@ -372,6 +391,8 @@ def main():
                     help="ty trong pha tron do cong Empirical Fisher toan phan (CE+Triplet) vao Sophia [0..1]")
     ap.add_argument("--ema_decay", type=float, default=0.0,
                     help="he so lam muot trong so Model EMA (vd 0.995; 0 = tat)")
+    ap.add_argument("--min_save_epoch", type=int, default=0,
+                    help="chi bat dau xet luu checkpoint tot nhat tu epoch nay tro di (tranh luu nham dinh nhieu som)")
     args = ap.parse_args()
 
     if args.tag and not re.fullmatch(r"[A-Za-z0-9]+", args.tag):
@@ -443,7 +464,7 @@ def main():
     head_classes = num_classes * args.arcface_k if args.arcface else num_classes
     model = build_model(args.model, head_classes, args.dropout, args.emb_pool,
                         feat_dim=args.feat_dim, lstm_layers=args.lstm_layers).to(device)
-    if args.arcface and model.head.bias is not None:
+    if args.arcface and args.switch_arcface_acc == 0.0 and args.arcface_warmup == 0.0 and model.head.bias is not None:
         model.head.bias.requires_grad_(False)
     print("Tham so:", sum(p.numel() for p in model.parameters()))
     criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
@@ -462,7 +483,8 @@ def main():
         ef_w = args.sophia_ef if args.sophia_ef > 0.0 else 1.0
         optimizer = SAM(
             model.parameters(), SophiaG, rho=sam_rho, adaptive=is_adaptive,
-            base_rho=args.rho, lr=args.lr, weight_decay=args.weight_decay, ef_weight=ef_w,
+            base_rho=args.rho, lr=args.lr, betas=(0.9, 0.999),
+            weight_decay=args.weight_decay, ef_weight=ef_w,
         )
     else:
         optimizer = base_opt_cls(model.parameters(), **opt_kwargs)
@@ -540,7 +562,7 @@ def main():
                 optimizer.step(bs=x.size(0))
                 optimizer.zero_grad()
 
-                if args.sophia_ef < 1.0 and global_step % args.sophia_k == 0:
+                if global_step % args.sophia_k == 0:
                     disable_running_stats(model)
                     if args.arcface:
                         emb_h = model.embed(x)
@@ -604,7 +626,8 @@ def main():
             print(f"  -> train_acc {tr_acc:.2f}% >= {args.decay_acc:.1f}%, "
                   f"bat dau giam lr theo cosine tu epoch {epoch + 1} ve {args.min_lr:.1e}")
 
-        if res["mean"] > best:
+        can_save = (epoch >= args.min_save_epoch) or (epoch == args.epochs and best_epoch == 0)
+        if can_save and res["mean"] > best:
             best, best_epoch = res["mean"], epoch
             torch.save({"model": model.state_dict(), "args": vars(args),
                         "num_classes": num_classes, "epoch": epoch,

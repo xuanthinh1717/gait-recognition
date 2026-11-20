@@ -53,6 +53,16 @@ class SophiaG(Optimizer):
                 state["hessian"].mul_(beta2).addcmul_(p.grad, p.grad, value=1.0 - beta2)
 
     @torch.no_grad()
+    def update_param_hessian(self, p, dg):
+        """Cap nhat EMA do cong tu hieu dao ham SAM (dg = g_adv - g_base)."""
+        beta2 = self.param_groups[0]["betas"][1]
+        state = self.state[p]
+        if len(state) == 0:
+            self._init_state(state, p)
+        state["hessian_step"] += 1
+        state["hessian"].mul_(beta2).addcmul_(dg, dg, value=1.0 - beta2)
+
+    @torch.no_grad()
     def update_ef_hessian(self):
         """Cap nhat EMA do cong Empirical Fisher tu gradient cua toan bo ham loss (CE + Triplet)."""
         for group in self.param_groups:
@@ -106,22 +116,27 @@ class SophiaG(Optimizer):
                     state["ef_step"] += 1
                     state["ef_hessian"].mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
                     bc_ef = 1.0 - beta2 ** state["ef_step"]
-                    h_ef = state["ef_hessian"] / bc_ef
+                    rms_grad = (state["ef_hessian"] / bc_ef).sqrt()
                 else:
-                    h_ef = None
+                    rms_grad = None
 
-                if state["hessian_step"] > 0:
-                    bc2 = 1.0 - beta2 ** state["hessian_step"]
-                    h_gnb = hessian / bc2
+                if rms_grad is not None:
+                    if state["hessian_step"] > 0:
+                        bc2 = 1.0 - beta2 ** state["hessian_step"]
+                        rms_curv = (hessian / bc2).sqrt()
+                    else:
+                        rms_curv = torch.zeros_like(rms_grad)
+                    # Ket hop chuan hoa RMS bac 1 (giu quy dao muot tren huong phang)
+                    # cong them giam chan do cong bac 2 cung thu nguyen [g]^1: sqrt(v_t) + rho * sqrt(h_t)
+                    denom = (ef_w * rms_grad + rho * rms_curv).clamp(min=eps)
+                    ratio = (m_hat / denom).clamp(-1.0, 1.0)
                 else:
-                    h_gnb = grad * grad
+                    if state["hessian_step"] > 0:
+                        bc2 = 1.0 - beta2 ** state["hessian_step"]
+                        h_gnb = hessian / bc2
+                    else:
+                        h_gnb = grad * grad
+                    denom = (rho * bs * h_gnb).clamp(min=eps)
+                    ratio = (m_hat / denom).clamp(-1.0, 1.0)
 
-                if ef_w >= 1.0:
-                    h_hat = h_ef
-                elif ef_w > 0.0:
-                    h_hat = (1.0 - ef_w) * h_gnb + ef_w * h_ef
-                else:
-                    h_hat = h_gnb
-
-                ratio = (m_hat / (rho * bs * h_hat).clamp(min=eps)).clamp(-1.0, 1.0)
                 p.add_(ratio, alpha=-lr)
