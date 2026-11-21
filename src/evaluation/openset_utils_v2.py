@@ -6,6 +6,7 @@ Ham dung chung cho train_v2.py va evaluate_openset_v2.py:
 """
 import numpy as np
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from src.models.cnn_gei_v2 import GEIEmbedCNN
@@ -26,11 +27,11 @@ def build_model(name, num_classes, dropout=None, pool="mean", feat_dim=None, lst
                    pool=pool, lstm_layers=lstm_layers)
 
 
-def make_dataset(name, csv_file, frames_path, T, train, eval_sample="center", ff_gei_m=0):
+def make_dataset(name, csv_file, frames_path, T, train, eval_sample="center", ff_gei_m=0, eval_clips=1):
     if name == "gei":
         return GEIDataset(csv_file, frames_path=frames_path)
     return SeqDataset(csv_file, frames_path=frames_path, T=T, train=train,
-                      eval_sample=eval_sample, ff_gei_m=ff_gei_m)
+                      eval_sample=eval_sample, ff_gei_m=ff_gei_m, eval_clips=eval_clips)
 
 
 @torch.no_grad()
@@ -42,7 +43,13 @@ def extract_embeddings(model, dataset, device, batch_size=32, num_workers=0):
                         num_workers=num_workers, pin_memory=(device.type == "cuda"))
     out = []
     for x, _ in loader:
-        out.append(net.embed(x.to(device)).float().cpu())
+        if x.dim() == 6:  # Multi-clip averaging: (B, K, T, 1, S, S)
+            B, K = x.shape[:2]
+            emb = net.embed(x.flatten(0, 1).to(device)).float()
+            emb = F.normalize(emb, p=2, dim=1).view(B, K, -1).mean(dim=1).cpu()
+        else:
+            emb = net.embed(x.to(device)).float().cpu()
+        out.append(emb)
     return torch.cat(out).numpy()
 
 

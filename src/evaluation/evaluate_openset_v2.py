@@ -22,7 +22,7 @@ from src.evaluation.openset_utils_v2 import (CONDS, build_model, extract_embeddi
                               make_dataset, rank1_openset)
 
 
-def evaluate(ckpt_path, split, splits_dir, frames, device, num_workers):
+def evaluate(ckpt_path, split, splits_dir, frames, device, num_workers, eval_clips=1):
     ck = torch.load(ckpt_path, map_location=device)
     a = ck["args"]
     head_classes = ck["num_classes"] * a.get("arcface_k", 1) if a.get("arcface") else ck["num_classes"]
@@ -36,10 +36,10 @@ def evaluate(ckpt_path, split, splits_dir, frames, device, num_workers):
     eval_sample = a.get("eval_sample", "center")
     ff_gei_m = a.get("ff_gei_m", 0)
     g = make_dataset(a["model"], f"{splits_dir}/{split}_gallery.csv", frames, a["T"],
-                     train=False, eval_sample=eval_sample, ff_gei_m=ff_gei_m)
+                     train=False, eval_sample=eval_sample, ff_gei_m=ff_gei_m, eval_clips=eval_clips)
     p = make_dataset(a["model"], f"{splits_dir}/{split}_probe.csv", frames, a["T"],
-                     train=False, eval_sample=eval_sample, ff_gei_m=ff_gei_m)
-    bs = 64 if a["model"] == "gei" else 16
+                     train=False, eval_sample=eval_sample, ff_gei_m=ff_gei_m, eval_clips=eval_clips)
+    bs = 64 if a["model"] == "gei" else (max(4, 16 // eval_clips) if eval_clips > 1 else 16)
     g_emb = extract_embeddings(model, g, device, bs, num_workers)
     p_emb = extract_embeddings(model, p, device, bs, num_workers)
     per_cond, per_angle = rank1_openset(g.df, g_emb, p.df, p_emb)
@@ -67,6 +67,8 @@ def main():
     ap.add_argument("--frames", default="data/npy/casiab_v2/frames.npy")
     ap.add_argument("--num_workers", type=int, default=2)
     ap.add_argument("--out_dir", default="results_v2")
+    ap.add_argument("--eval_clips", type=int, default=1,
+                    help="so clip T=30 trai deu toan bo video de lay trung binh embedding (>1 bat Multi-clip Averaging)")
     args = ap.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -75,7 +77,8 @@ def main():
     runs = []
     for path in args.ckpt:
         a, ck, per_cond, per_angle = evaluate(
-            path, args.split, args.splits, args.frames, device, args.num_workers)
+            path, args.split, args.splits, args.frames, device, args.num_workers,
+            eval_clips=args.eval_clips)
         name = os.path.splitext(os.path.basename(path))[0]
         print_run(name, ck, per_cond, per_angle)
         key = a["model"] + (f"_{a['tag']}" if a.get("tag") else "")

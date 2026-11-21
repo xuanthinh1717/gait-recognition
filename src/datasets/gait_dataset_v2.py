@@ -31,9 +31,10 @@ class SeqDataset(Dataset):
     """
 
     def __init__(self, csv_file, frames_path="data/npy/casiab_v2/frames.npy",
-                 T=30, train=False, eval_sample="center", ff_gei_m=0):
+                 T=30, train=False, eval_sample="center", ff_gei_m=0, eval_clips=1):
         assert eval_sample in ("center", "linspace")
         assert ff_gei_m >= 0
+        assert eval_clips >= 1
         self.df = pd.read_csv(csv_file, dtype=CSV_DTYPES)
         self.starts = self.df["start"].to_numpy()
         self.lengths = self.df["length"].to_numpy()
@@ -43,6 +44,7 @@ class SeqDataset(Dataset):
         self.train = train
         self.eval_sample = eval_sample
         self.ff_gei_m = int(ff_gei_m)
+        self.eval_clips = int(eval_clips)
         self._frames = None  # mo mmap o moi worker, khong pickle qua process
 
     def __len__(self):
@@ -67,10 +69,7 @@ class SeqDataset(Dataset):
             return np.linspace(0, length - 1, T).round().astype(int)
         return np.arange(T) % length
 
-    def __getitem__(self, idx):
-        start, length = int(self.starts[idx]), int(self.lengths[idx])
-        rel = self._pick(length)
-        frames = self._get_frames()
+    def _extract_clip(self, frames, start, length, rel):
         if self.ff_gei_m > 0:
             offsets = np.arange(-self.ff_gei_m, self.ff_gei_m + 1)
             win_idx = np.clip(rel[:, None] + offsets[None, :], 0, length - 1)
@@ -79,8 +78,24 @@ class SeqDataset(Dataset):
             seq = block[win_idx - lo].mean(axis=1) / 255.0
         else:
             seq = np.asarray(frames[start + rel], dtype=np.float32) / 255.0
-        x = torch.from_numpy(seq).unsqueeze(1)          # (T, 1, S, S)
-        return x, torch.tensor(int(self.labels[idx]), dtype=torch.long)
+        return torch.from_numpy(seq).unsqueeze(1)          # (T, 1, S, S)
+
+    def __getitem__(self, idx):
+        start, length = int(self.starts[idx]), int(self.lengths[idx])
+        frames = self._get_frames()
+        label = torch.tensor(int(self.labels[idx]), dtype=torch.long)
+        if not self.train and self.eval_clips > 1:
+            if length > self.T:
+                offs = np.linspace(0, length - self.T, self.eval_clips).round().astype(int)
+                clips = [self._extract_clip(frames, start, length, np.arange(o, o + self.T)) for o in offs]
+            else:
+                rel = np.arange(self.T) % length
+                clip = self._extract_clip(frames, start, length, rel)
+                clips = [clip] * self.eval_clips
+            return torch.stack(clips, dim=0), label      # (K, T, 1, S, S)
+
+        rel = self._pick(length)
+        return self._extract_clip(frames, start, length, rel), label
 
 
 class GEIDataset(Dataset):
