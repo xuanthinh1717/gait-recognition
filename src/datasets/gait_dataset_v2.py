@@ -109,6 +109,7 @@ class GEIDataset(Dataset):
         self.use_npy = (self.npy_idx is not None and frames_path is not None
                         and os.path.exists(frames_path))
         self._frames = None
+        self._cache = {} if (not self.use_npy and len(self.df) <= 20000) else None
 
     def __len__(self):
         return len(self.df)
@@ -119,6 +120,8 @@ class GEIDataset(Dataset):
         return self._frames
 
     def __getitem__(self, idx):
+        if self._cache is not None and idx in self._cache:
+            return self._cache[idx], torch.tensor(int(self.labels[idx]), dtype=torch.long)
         if self.use_npy:
             img = self._get_frames()[int(self.npy_idx[idx])]
         else:
@@ -126,4 +129,6 @@ class GEIDataset(Dataset):
             if img is None:
                 raise FileNotFoundError(self.paths[idx])
         x = torch.from_numpy(np.asarray(img, dtype=np.float32) / 255.0).unsqueeze(0)  # (1, S, S)
+        if self._cache is not None:
+            self._cache[idx] = x
         return x, torch.tensor(int(self.labels[idx]), dtype=torch.long)

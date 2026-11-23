@@ -371,6 +371,8 @@ def main():
                     help="ban kinh rho cho SAM/ASAM/Sophia (mac dinh: sam=0.05, asam=0.5, sophia=0.04, samsophia=0.02)")
     ap.add_argument("--sam_rho", type=float, default=None,
                     help="ban kinh nhieu SAM khi dung samsophia/asamsophia (mac dinh: samsophia=0.05, asamsophia=0.5)")
+    ap.add_argument("--rho_schedule", default="none", choices=["none", "cos", "damped"],
+                    help="lich thay doi ban kinh rho cua SAM/ASAM: none (co dinh), cos (+a -> -a), damped (a*cos(pi*t/T)*(1-t/T))")
     ap.add_argument("--metric_loss", default="triplet", choices=["triplet", "supcon"],
                     help="ham metric loss khi triplet_weight > 0: triplet (mac dinh) hoac supcon")
     ap.add_argument("--arcface", action="store_true",
@@ -429,7 +431,7 @@ def main():
                                  "emb_pool", "eval_sample", "triplet_weight",
                                  "triplet_margin", "pk_k", "label_smoothing",
                                  "decay_acc", "min_lr", "ff_gei_m", "lstm_layers",
-                                 "optimizer", "rho", "sam_rho", "metric_loss",
+                                 "optimizer", "rho", "sam_rho", "rho_schedule", "metric_loss",
                                  "arcface", "arcface_s", "arcface_m", "arcface_k",
                                  "switch_arcface_acc", "arcface_warmup",
                                  "sophia_k", "sophia_ef", "ema_decay")})
@@ -510,6 +512,8 @@ def main():
     global_step = 0
     active_arcface = args.arcface and (args.switch_arcface_acc == 0.0)
     arcface_start_epoch = 1 if active_arcface else None
+    base_sam_rho = (optimizer.param_groups[0].get("sam_rho", args.rho)
+                    if args.optimizer in ("sam", "asam", "samsophia", "asamsophia") else None)
     for epoch in range(1, args.epochs + 1):
         if decay_start_epoch is not None:
             scheduler = None
@@ -518,6 +522,17 @@ def main():
             cur_lr = args.min_lr + 0.5 * (args.lr - args.min_lr) * (1.0 + math.cos(math.pi * prog))
             for pg in optimizer.param_groups:
                 pg["lr"] = cur_lr
+
+        cur_sam_rho = base_sam_rho
+        if base_sam_rho is not None and args.rho_schedule != "none":
+            if args.rho_schedule == "cos":
+                u = (epoch - 1) / max(1, args.epochs - 1)
+                cur_sam_rho = base_sam_rho * math.cos(math.pi * u)
+            elif args.rho_schedule == "damped":
+                u = (epoch - 1) / max(1, args.epochs)
+                cur_sam_rho = base_sam_rho * math.cos(math.pi * u) * (1.0 - u)
+            for pg in optimizer.param_groups:
+                pg["sam_rho"] = cur_sam_rho
 
         if active_arcface:
             if args.arcface_warmup > 0 and arcface_start_epoch is not None:
@@ -618,7 +633,8 @@ def main():
         cond_str = (f"NM {r_nm:.1f} BG {r_bg:.1f} CL {r_cl:.1f}"
                     if "bg" in res or "cl" in res else f"NM {r_nm:.2f}")
         m_str = f" m={cur_m:.3f}" if args.arcface else ""
-        print(f"Epoch [{epoch}/{args.epochs}] lr {cur_lr:.2e}{m_str} loss {tr_loss:.4f} acc {tr_acc:.2f}% | "
+        rho_str = f" rho={cur_sam_rho:+.4f}" if (cur_sam_rho is not None and args.rho_schedule != "none") else ""
+        print(f"Epoch [{epoch}/{args.epochs}] lr {cur_lr:.2e}{rho_str}{m_str} loss {tr_loss:.4f} acc {tr_acc:.2f}% | "
               f"val Rank-1 {cond_str} mean {res['mean']:.2f}")
 
         if args.decay_acc > 0 and decay_start_epoch is None and tr_acc >= args.decay_acc:
