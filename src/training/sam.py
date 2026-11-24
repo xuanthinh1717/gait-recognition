@@ -62,14 +62,19 @@ class SAM(torch.optim.Optimizer):
 
     def _grad_norm(self):
         shared_device = self.param_groups[0]["params"][0].device
-        norms = [
-            ((torch.abs(p) if group["adaptive"] else 1.0) * p.grad).detach().norm(p=2).to(shared_device)
-            for group in self.param_groups
-            for p in group["params"]
-            if p.grad is not None
-        ]
-        if not norms:
+        vals = []
+        for group in self.param_groups:
+            if group["adaptive"]:
+                for p in group["params"]:
+                    if p.grad is not None:
+                        vals.append((torch.abs(p) * p.grad).detach())
+            else:
+                for p in group["params"]:
+                    if p.grad is not None:
+                        vals.append(p.grad.detach())
+        if not vals:
             return torch.tensor(0.0, device=shared_device)
+        norms = [n.to(shared_device) for n in torch._foreach_norm(vals, 2)]
         return torch.norm(torch.stack(norms), p=2)
 
     def step(self, closure=None):

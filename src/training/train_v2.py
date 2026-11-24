@@ -51,10 +51,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-from torch.utils.data import DataLoader, Sampler
+from torch.utils.data import Sampler
 
 from src.evaluation.openset_utils_v2 import (build_model, extract_embeddings, make_dataset,
-                                              rank1_openset)
+                                              make_loader, rank1_openset, to_float_input)
 from src.training.sam import SAM, disable_running_stats, enable_running_stats
 from src.training.sophia import SophiaG
 
@@ -126,23 +126,24 @@ def batch_hard_triplet_loss(emb, y, margin=0.2):
         hard_neg = min_{k: y_k != y_i} d(i, k)
         loss_i   = relu(hard_pos - hard_neg + margin)
     """
-    z = F.normalize(emb, p=2, dim=1)
-    dist = (1.0 - z @ z.T).clamp(min=0.0)
-    eye = torch.eye(y.size(0), dtype=torch.bool, device=y.device)
-    same = y.unsqueeze(0) == y.unsqueeze(1)
-    pos_mask = same & ~eye
-    neg_mask = ~same
+    with torch.amp.autocast("cuda", enabled=False):
+        z = F.normalize(emb.float(), p=2, dim=1)
+        dist = (1.0 - z @ z.T).clamp(min=0.0)
+        eye = torch.eye(y.size(0), dtype=torch.bool, device=y.device)
+        same = y.unsqueeze(0) == y.unsqueeze(1)
+        pos_mask = same & ~eye
+        neg_mask = ~same
 
-    if not pos_mask.any(dim=1).all() or not neg_mask.any(dim=1).all():
-        return emb.new_tensor(0.0)
+        if not pos_mask.any(dim=1).all() or not neg_mask.any(dim=1).all():
+            return z.new_tensor(0.0)
 
-    # Hardest positive: gan -inf cho cac vi tri khong phai positive
-    hard_pos = dist.masked_fill(~pos_mask, -1e9).max(dim=1).values
+        # Hardest positive: gan -inf cho cac vi tri khong phai positive
+        hard_pos = dist.masked_fill(~pos_mask, -1e9).max(dim=1).values
 
-    # Hardest negative: gan +inf cho cac vi tri cung lop
-    hard_neg = dist.masked_fill(~neg_mask, 1e9).min(dim=1).values
+        # Hardest negative: gan +inf cho cac vi tri cung lop
+        hard_neg = dist.masked_fill(~neg_mask, 1e9).min(dim=1).values
 
-    return F.relu(hard_pos - hard_neg + margin).mean()
+        return F.relu(hard_pos - hard_neg + margin).mean()
 
 
 def supcon_loss(emb, y, temperature=0.1):
@@ -151,21 +152,22 @@ def supcon_loss(emb, y, temperature=0.1):
     Keo TAT CA cac mau cung nguoi (positive) trong batch lai gan nhau,
     dong thoi day tat ca cac mau khac nguoi (negative) ra xa.
     """
-    z = F.normalize(emb, p=2, dim=1)
-    sim = (z @ z.T) / temperature
-    sim = sim - sim.max(dim=1, keepdim=True).values.detach()
+    with torch.amp.autocast("cuda", enabled=False):
+        z = F.normalize(emb.float(), p=2, dim=1)
+        sim = (z @ z.T) / temperature
+        sim = sim - sim.max(dim=1, keepdim=True).values.detach()
 
-    eye = torch.eye(y.size(0), dtype=torch.bool, device=y.device)
-    same = y.unsqueeze(0) == y.unsqueeze(1)
-    pos_mask = same & ~eye
+        eye = torch.eye(y.size(0), dtype=torch.bool, device=y.device)
+        same = y.unsqueeze(0) == y.unsqueeze(1)
+        pos_mask = same & ~eye
 
-    if not pos_mask.any(dim=1).all():
-        return emb.new_tensor(0.0)
+        if not pos_mask.any(dim=1).all():
+            return z.new_tensor(0.0)
 
-    exp_sim = torch.exp(sim).masked_fill(eye, 0.0)
-    log_prob = sim - torch.log(exp_sim.sum(dim=1, keepdim=True) + 1e-12)
-    mean_log_prob_pos = log_prob.masked_fill(~pos_mask, 0.0).sum(dim=1) / pos_mask.sum(dim=1)
-    return -mean_log_prob_pos.mean()
+        exp_sim = torch.exp(sim).masked_fill(eye, 0.0)
+        log_prob = sim - torch.log(exp_sim.sum(dim=1, keepdim=True) + 1e-12)
+        mean_log_prob_pos = log_prob.masked_fill(~pos_mask, 0.0).sum(dim=1) / pos_mask.sum(dim=1)
+        return -mean_log_prob_pos.mean()
 
 
 def arcface_logits(emb, weight, y, s=30.0, m=0.35, k=1, return_clean=False):
@@ -177,30 +179,31 @@ def arcface_logits(emb, weight, y, s=30.0, m=0.35, k=1, return_clean=False):
     Neu return_clean=True: tra ve (logits_co_margin, clean_cosine_logits) de tinh train_acc
     trung thuc tren mat cau ma khong bi bien do m lamlech nguong decay_acc.
     """
-    x_norm = F.normalize(emb, p=2, dim=1)
-    w_norm = F.normalize(weight, p=2, dim=1)
-    cosine = F.linear(x_norm, w_norm)
-    if k > 1:
-        cosine = cosine.view(emb.size(0), -1, k).max(dim=2).values
-    cosine = cosine.clamp(-1.0 + 1e-7, 1.0 - 1e-7)
-    clean_logits = cosine * s
+    with torch.amp.autocast("cuda", enabled=False):
+        x_norm = F.normalize(emb.float(), p=2, dim=1)
+        w_norm = F.normalize(weight.float(), p=2, dim=1)
+        cosine = F.linear(x_norm, w_norm)
+        if k > 1:
+            cosine = cosine.view(emb.size(0), -1, k).max(dim=2).values
+        cosine = cosine.clamp(-1.0 + 1e-7, 1.0 - 1e-7)
+        clean_logits = cosine * s
 
-    if m == 0.0:
-        return (clean_logits, clean_logits) if return_clean else clean_logits
+        if m == 0.0:
+            return (clean_logits, clean_logits) if return_clean else clean_logits
 
-    cos_m = math.cos(m)
-    sin_m = math.sin(m)
-    th = math.cos(math.pi - m)
-    mm = math.sin(math.pi - m) * m
+        cos_m = math.cos(m)
+        sin_m = math.sin(m)
+        th = math.cos(math.pi - m)
+        mm = math.sin(math.pi - m) * m
 
-    sine = torch.sqrt((1.0 - cosine * cosine).clamp(min=1e-12))
-    phi = cosine * cos_m - sine * sin_m
-    phi = torch.where(cosine > th, phi, cosine - mm)
+        sine = torch.sqrt((1.0 - cosine * cosine).clamp(min=1e-12))
+        phi = cosine * cos_m - sine * sin_m
+        phi = torch.where(cosine > th, phi, cosine - mm)
 
-    one_hot = torch.zeros_like(cosine)
-    one_hot.scatter_(1, y.view(-1, 1).long(), 1.0)
-    logits = ((one_hot * phi) + ((1.0 - one_hot) * cosine)) * s
-    return (logits, clean_logits) if return_clean else logits
+        one_hot = torch.zeros_like(cosine)
+        one_hot.scatter_(1, y.view(-1, 1).long(), 1.0)
+        logits = ((one_hot * phi) + ((1.0 - one_hot) * cosine)) * s
+        return (logits, clean_logits) if return_clean else logits
 
 
 class ModelEMA:
@@ -267,9 +270,9 @@ def incremental_loss(model, x, y, label_smoothing=0.0,
         y_rep = y.repeat_interleave(T)
         steps_flat = steps.reshape(B * T, C)
 
-    w = torch.arange(1, T + 1, device=x.device, dtype=steps.dtype) ** 2
+    w = torch.arange(1, T + 1, device=x.device, dtype=torch.float32) ** 2
     w = w / w.sum()
-    ce = F.cross_entropy(steps_flat, y_rep,
+    ce = F.cross_entropy(steps_flat.float(), y_rep,
                          reduction="none", label_smoothing=label_smoothing).view(B, T)
     return (ce * w).sum(dim=1).mean(), clean_steps[:, -1], emb
 
@@ -289,7 +292,7 @@ def compute_batch_loss(model, x, y, criterion, args, active_arcface=None, cur_m=
         out_lin, emb = model(x, return_embed=True)
         if args.arcface_k > 1:
             out_lin = out_lin.view(out_lin.size(0), -1, args.arcface_k).max(dim=2).values
-        loss_lin = criterion(out_lin, y)
+        loss_lin = criterion(out_lin.float(), y)
         if use_arcface and m_val > 0.0:
             logits_arc = arcface_logits(
                 emb, model.head.weight, y,
@@ -314,7 +317,7 @@ def compute_batch_loss(model, x, y, criterion, args, active_arcface=None, cur_m=
         out, emb = model(x, return_embed=True)
         if args.arcface and args.arcface_k > 1:
             out = out.view(out.size(0), -1, args.arcface_k).max(dim=2).values
-        loss = criterion(out, y)
+        loss = criterion(out.float(), y)
     if args.triplet_weight > 0:
         if args.metric_loss == "supcon":
             m_loss = supcon_loss(emb, y)
@@ -395,6 +398,10 @@ def main():
                     help="he so lam muot trong so Model EMA (vd 0.995; 0 = tat)")
     ap.add_argument("--min_save_epoch", type=int, default=0,
                     help="chi bat dau xet luu checkpoint tot nhat tu epoch nay tro di (tranh luu nham dinh nhieu som)")
+    ap.add_argument("--val_every", type=int, default=1,
+                    help="chu ky validate (epoch) khi epoch < min_save_epoch; tu min_save_epoch luon validate moi epoch")
+    ap.add_argument("--amp", action="store_true",
+                    help="bat mixed precision FP16 (torch.amp.autocast) khi train tren CUDA")
     args = ap.parse_args()
 
     if args.tag and not re.fullmatch(r"[A-Za-z0-9]+", args.tag):
@@ -404,6 +411,8 @@ def main():
         sys.exit("--incremental_loss, --emb_pool last, --lstm_layers chi dung voi --model lstm.")
     if args.arcface_k < 1:
         sys.exit("--arcface_k phai >= 1.")
+    if args.val_every < 1:
+        sys.exit("--val_every phai >= 1.")
 
     if args.batch_size is None:
         args.batch_size = 128 if args.model == "gei" else 16
@@ -424,7 +433,10 @@ def main():
 
     seed_everything(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print("Device:", device, "| run:", tag)
+    use_amp = bool(args.amp and device.type == "cuda")
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+    print("Device:", device, "| run:", tag, "| amp:", use_amp)
     print("Cau hinh:", {k: v for k, v in vars(args).items()
                         if k in ("lr", "dropout", "feat_dim", "batch_size", "T", "epochs",
                                  "clip_grad", "weight_decay", "warmup_epochs", "incremental_loss",
@@ -434,34 +446,41 @@ def main():
                                  "optimizer", "rho", "sam_rho", "rho_schedule", "metric_loss",
                                  "arcface", "arcface_s", "arcface_m", "arcface_k",
                                  "switch_arcface_acc", "arcface_warmup",
-                                 "sophia_k", "sophia_ef", "ema_decay")})
+                                 "sophia_k", "sophia_ef", "ema_decay", "val_every", "amp")})
 
     sp = args.splits
     num_classes = json.load(open(os.path.join(sp, "split_info.json")))["num_train_classes"]
     print("num_classes:", num_classes)
 
     train_ds = make_dataset(args.model, f"{sp}/train.csv", args.frames, args.T, train=True,
-                            eval_sample=args.eval_sample, ff_gei_m=args.ff_gei_m)
+                            eval_sample=args.eval_sample, ff_gei_m=args.ff_gei_m, return_uint8=True)
     val_g = make_dataset(args.model, f"{sp}/val_gallery.csv", args.frames, args.T, train=False,
-                         eval_sample=args.eval_sample, ff_gei_m=args.ff_gei_m)
+                         eval_sample=args.eval_sample, ff_gei_m=args.ff_gei_m, return_uint8=True)
     val_p = make_dataset(args.model, f"{sp}/val_probe.csv", args.frames, args.T, train=False,
-                         eval_sample=args.eval_sample, ff_gei_m=args.ff_gei_m)
+                         eval_sample=args.eval_sample, ff_gei_m=args.ff_gei_m, return_uint8=True)
 
     gen = torch.Generator().manual_seed(args.seed)
+    persist = args.num_workers > 0
+    pin_mem = device.type == "cuda"
     if args.triplet_weight > 0:
         pk_sampler = PKSampler(train_ds.labels, batch_size=args.batch_size,
                                k=args.pk_k, seed=args.seed)
-        train_loader = DataLoader(
-            train_ds, batch_sampler=pk_sampler,
-            num_workers=args.num_workers, worker_init_fn=seed_worker, generator=gen,
-            pin_memory=(device.type == "cuda"),
+        train_loader = make_loader(
+            train_ds, batch_size=args.batch_size, num_workers=args.num_workers,
+            pin_memory=pin_mem, batch_sampler=pk_sampler,
+            worker_init_fn=seed_worker, generator=gen, persistent=persist,
         )
     else:
-        train_loader = DataLoader(
-            train_ds, batch_size=args.batch_size, shuffle=True, drop_last=True,
-            num_workers=args.num_workers, worker_init_fn=seed_worker, generator=gen,
-            pin_memory=(device.type == "cuda"),
+        train_loader = make_loader(
+            train_ds, batch_size=args.batch_size, num_workers=args.num_workers,
+            pin_memory=pin_mem, shuffle=True, drop_last=True,
+            worker_init_fn=seed_worker, generator=gen, persistent=persist,
         )
+    val_bs = 64 if args.model == "gei" else 16
+    val_g_loader = make_loader(val_g, batch_size=val_bs, num_workers=args.num_workers,
+                               pin_memory=pin_mem, shuffle=False, persistent=persist)
+    val_p_loader = make_loader(val_p, batch_size=val_bs, num_workers=args.num_workers,
+                               pin_memory=pin_mem, shuffle=False, persistent=persist)
 
     head_classes = num_classes * args.arcface_k if args.arcface else num_classes
     model = build_model(args.model, head_classes, args.dropout, args.emb_pool,
@@ -506,6 +525,7 @@ def main():
         csv.writer(f).writerow(
             ["epoch", "train_loss", "train_acc", "val_nm", "val_bg", "val_cl", "val_mean"])
 
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     best = -1.0
     best_epoch = 0
     decay_start_epoch = None
@@ -546,48 +566,77 @@ def main():
         model.train()
         run_loss, correct, total = 0.0, 0, 0
         for x, y in train_loader:
-            x, y = x.to(device), y.to(device)
+            x = to_float_input(x, device)
+            y = y.to(device, non_blocking=True)
             if args.optimizer in ("sam", "asam", "samsophia", "asamsophia"):
                 enable_running_stats(model)
-                loss, out, emb = compute_batch_loss(model, x, y, criterion, args,
-                                                    active_arcface=active_arcface, cur_m=cur_m)
-                loss.backward()
+                with torch.amp.autocast("cuda", enabled=use_amp):
+                    loss, out, emb = compute_batch_loss(model, x, y, criterion, args,
+                                                        active_arcface=active_arcface, cur_m=cur_m)
+                scaler.scale(loss).backward()
+                if use_amp:
+                    scaler.unscale_(optimizer)
+                    if not torch.isfinite(optimizer._grad_norm()):
+                        optimizer.zero_grad()
+                        scaler.update()
+                        continue
                 if args.clip_grad > 0:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
                 optimizer.first_step(zero_grad=True)
+                if use_amp:
+                    scaler.update()
 
                 disable_running_stats(model)
-                loss2, _, _ = compute_batch_loss(model, x, y, criterion, args,
-                                                 active_arcface=active_arcface, cur_m=cur_m)
-                loss2.backward()
+                with torch.amp.autocast("cuda", enabled=use_amp):
+                    loss2, _, _ = compute_batch_loss(model, x, y, criterion, args,
+                                                     active_arcface=active_arcface, cur_m=cur_m)
+                scaler.scale(loss2).backward()
+                if use_amp:
+                    scaler.unscale_(optimizer)
+                    if not torch.isfinite(optimizer._grad_norm()):
+                        for pg in optimizer.param_groups:
+                            for p in pg["params"]:
+                                if "old_p" in optimizer.state[p]:
+                                    p.data.copy_(optimizer.state[p]["old_p"])
+                        optimizer.zero_grad()
+                        scaler.update()
+                        continue
                 if args.clip_grad > 0:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
                 if args.optimizer in ("samsophia", "asamsophia"):
                     optimizer.second_step(zero_grad=True, bs=x.size(0))
                 else:
                     optimizer.second_step(zero_grad=True)
+                if use_amp:
+                    scaler.update()
             elif args.optimizer == "sophia":
                 enable_running_stats(model)
                 optimizer.zero_grad()
-                loss, out, emb = compute_batch_loss(model, x, y, criterion, args,
-                                                    active_arcface=active_arcface, cur_m=cur_m)
-                loss.backward()
+                with torch.amp.autocast("cuda", enabled=use_amp):
+                    loss, out, emb = compute_batch_loss(model, x, y, criterion, args,
+                                                        active_arcface=active_arcface, cur_m=cur_m)
+                scaler.scale(loss).backward()
+                if use_amp:
+                    scaler.unscale_(optimizer)
                 if args.clip_grad > 0:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
-                optimizer.step(bs=x.size(0))
+                scaler.step(optimizer, bs=x.size(0))
+                scaler.update()
                 optimizer.zero_grad()
 
                 if global_step % args.sophia_k == 0:
                     disable_running_stats(model)
-                    if args.arcface:
-                        emb_h = model.embed(x)
-                        out_h = arcface_logits(emb_h, model.head.weight, y,
-                                               s=args.arcface_s, m=0.0, k=args.arcface_k)
-                    else:
-                        out_h = model(x)
-                    with torch.no_grad():
-                        y_hat = torch.distributions.Categorical(logits=out_h.detach()).sample()
-                    loss_h = F.cross_entropy(out_h, y_hat)
+                    with torch.amp.autocast("cuda", enabled=use_amp):
+                        if args.arcface:
+                            emb_h = model.embed(x)
+                            out_h = arcface_logits(emb_h, model.head.weight, y,
+                                                   s=args.arcface_s, m=0.0, k=args.arcface_k)
+                        else:
+                            out_h = model(x)
+                        out_h_f = out_h.float()
+                        with torch.no_grad():
+                            y_hat = torch.distributions.Categorical(logits=out_h_f.detach()).sample()
+                        loss_h = F.cross_entropy(out_h_f, y_hat)
                     loss_h.backward()
                     optimizer.update_hessian()
                     optimizer.zero_grad()
@@ -595,12 +644,16 @@ def main():
                 global_step += 1
             else:
                 optimizer.zero_grad()
-                loss, out, emb = compute_batch_loss(model, x, y, criterion, args,
-                                                    active_arcface=active_arcface, cur_m=cur_m)
-                loss.backward()
+                with torch.amp.autocast("cuda", enabled=use_amp):
+                    loss, out, emb = compute_batch_loss(model, x, y, criterion, args,
+                                                        active_arcface=active_arcface, cur_m=cur_m)
+                scaler.scale(loss).backward()
+                if use_amp:
+                    scaler.unscale_(optimizer)
                 if args.clip_grad > 0:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
-                optimizer.step()
+                scaler.step(optimizer)
+                scaler.update()
 
             if ema is not None:
                 ema.update(model)
@@ -618,44 +671,53 @@ def main():
             print(f"  -> train_acc {tr_acc:.2f}% >= {args.switch_arcface_acc:.1f}%, "
                   f"BAT ArcFace (m={args.arcface_m}, s={args.arcface_s}, warmup={args.arcface_warmup}) tu epoch {epoch + 1}")
 
-        # --- validation open-set: embedding + cosine tren nguoi chua tung thay ---
-        if ema is not None:
-            ema.apply_shadow(model)
-        bs = 64 if args.model == "gei" else 16
-        g_emb = extract_embeddings(model, val_g, device, bs, args.num_workers)
-        p_emb = extract_embeddings(model, val_p, device, bs, args.num_workers)
-        res, _ = rank1_openset(val_g.df, g_emb, val_p.df, p_emb)
-
         cur_lr = optimizer.param_groups[0]["lr"]
-        r_nm = res.get("nm", float("nan"))
-        r_bg = res.get("bg", float("nan"))
-        r_cl = res.get("cl", float("nan"))
-        cond_str = (f"NM {r_nm:.1f} BG {r_bg:.1f} CL {r_cl:.1f}"
-                    if "bg" in res or "cl" in res else f"NM {r_nm:.2f}")
         m_str = f" m={cur_m:.3f}" if args.arcface else ""
         rho_str = f" rho={cur_sam_rho:+.4f}" if (cur_sam_rho is not None and args.rho_schedule != "none") else ""
-        print(f"Epoch [{epoch}/{args.epochs}] lr {cur_lr:.2e}{rho_str}{m_str} loss {tr_loss:.4f} acc {tr_acc:.2f}% | "
-              f"val Rank-1 {cond_str} mean {res['mean']:.2f}")
+        do_val = (epoch >= args.min_save_epoch) or (epoch % args.val_every == 0) or (epoch == args.epochs)
+
+        if do_val:
+            # --- validation open-set: embedding + cosine tren nguoi chua tung thay ---
+            if ema is not None:
+                ema.apply_shadow(model)
+            g_emb = extract_embeddings(model, val_g, device, val_bs, args.num_workers,
+                                       loader=val_g_loader, amp=use_amp)
+            p_emb = extract_embeddings(model, val_p, device, val_bs, args.num_workers,
+                                       loader=val_p_loader, amp=use_amp)
+            res, _ = rank1_openset(val_g.df, g_emb, val_p.df, p_emb)
+
+            r_nm = res.get("nm", float("nan"))
+            r_bg = res.get("bg", float("nan"))
+            r_cl = res.get("cl", float("nan"))
+            r_mean = res["mean"]
+            cond_str = (f"NM {r_nm:.1f} BG {r_bg:.1f} CL {r_cl:.1f}"
+                        if "bg" in res or "cl" in res else f"NM {r_nm:.2f}")
+            print(f"Epoch [{epoch}/{args.epochs}] lr {cur_lr:.2e}{rho_str}{m_str} loss {tr_loss:.4f} acc {tr_acc:.2f}% | "
+                  f"val Rank-1 {cond_str} mean {r_mean:.2f}")
+
+            can_save = (epoch >= args.min_save_epoch) or (epoch == args.epochs and best_epoch == 0)
+            if can_save and r_mean > best:
+                best, best_epoch = r_mean, epoch
+                torch.save({"model": model.state_dict(), "args": vars(args),
+                            "num_classes": num_classes, "epoch": epoch,
+                            "val_mean": best}, ckpt_path)
+                print(f"  -> saved (best val mean Rank-1 {best:.2f})")
+
+            if ema is not None:
+                ema.restore(model)
+        else:
+            r_nm = r_bg = r_cl = r_mean = float("nan")
+            print(f"Epoch [{epoch}/{args.epochs}] lr {cur_lr:.2e}{rho_str}{m_str} loss {tr_loss:.4f} acc {tr_acc:.2f}% | "
+                  f"val (bo qua, val_every={args.val_every})")
 
         if args.decay_acc > 0 and decay_start_epoch is None and tr_acc >= args.decay_acc:
             decay_start_epoch = epoch
             print(f"  -> train_acc {tr_acc:.2f}% >= {args.decay_acc:.1f}%, "
                   f"bat dau giam lr theo cosine tu epoch {epoch + 1} ve {args.min_lr:.1e}")
 
-        can_save = (epoch >= args.min_save_epoch) or (epoch == args.epochs and best_epoch == 0)
-        if can_save and res["mean"] > best:
-            best, best_epoch = res["mean"], epoch
-            torch.save({"model": model.state_dict(), "args": vars(args),
-                        "num_classes": num_classes, "epoch": epoch,
-                        "val_mean": best}, ckpt_path)
-            print(f"  -> saved (best val mean Rank-1 {best:.2f})")
-
-        if ema is not None:
-            ema.restore(model)
-
         with open(log_path, "a", newline="") as f:
             csv.writer(f).writerow(
-                [epoch, tr_loss, tr_acc, r_nm, r_bg, r_cl, res["mean"]])
+                [epoch, tr_loss, tr_acc, r_nm, r_bg, r_cl, r_mean])
 
     print(f"Xong. Best epoch {best_epoch}, val mean Rank-1 {best:.2f} -> {ckpt_path}")
 

@@ -27,28 +27,56 @@ def build_model(name, num_classes, dropout=None, pool="mean", feat_dim=None, lst
                    pool=pool, lstm_layers=lstm_layers)
 
 
-def make_dataset(name, csv_file, frames_path, T, train, eval_sample="center", ff_gei_m=0, eval_clips=1):
+def make_dataset(name, csv_file, frames_path, T, train, eval_sample="center",
+                 ff_gei_m=0, eval_clips=1, return_uint8=False):
     if name == "gei":
-        return GEIDataset(csv_file, frames_path=frames_path)
+        return GEIDataset(csv_file, frames_path=frames_path, return_uint8=return_uint8)
     return SeqDataset(csv_file, frames_path=frames_path, T=T, train=train,
-                      eval_sample=eval_sample, ff_gei_m=ff_gei_m, eval_clips=eval_clips)
+                      eval_sample=eval_sample, ff_gei_m=ff_gei_m,
+                      eval_clips=eval_clips, return_uint8=return_uint8)
+
+
+def make_loader(dataset, batch_size, num_workers=0, pin_memory=False,
+                shuffle=False, drop_last=False, batch_sampler=None, generator=None,
+                worker_init_fn=None, persistent=False):
+    """Tao DataLoader; bat persistent_workers khi tai su dung qua nhieu epoch."""
+    kw = dict(num_workers=num_workers, pin_memory=pin_memory)
+    if num_workers > 0 and persistent:
+        kw["persistent_workers"] = True
+    if batch_sampler is not None:
+        return DataLoader(dataset, batch_sampler=batch_sampler,
+                          worker_init_fn=worker_init_fn, generator=generator, **kw)
+    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, drop_last=drop_last,
+                      worker_init_fn=worker_init_fn, generator=generator, **kw)
+
+
+def to_float_input(x, device):
+    """Chuyen tensor (ke ca uint8 tu DataLoader) len GPU va chuan hoa [0, 1]."""
+    x = x.to(device, non_blocking=True)
+    return x.float().mul_(1.0 / 255.0) if x.dtype == torch.uint8 else x
 
 
 @torch.no_grad()
-def extract_embeddings(model, dataset, device, batch_size=32, num_workers=0):
+def extract_embeddings(model, dataset, device, batch_size=32, num_workers=0,
+                       loader=None, amp=False):
     """Tra ve (N, D) theo dung thu tu dong cua dataset.df."""
     net = model.module if hasattr(model, "module") else model
     net.eval()
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False,
-                        num_workers=num_workers, pin_memory=(device.type == "cuda"))
+    if loader is None:
+        loader = make_loader(dataset, batch_size=batch_size, num_workers=num_workers,
+                             pin_memory=(device.type == "cuda"), shuffle=False)
+    use_amp = amp and device.type == "cuda"
     out = []
     for x, _ in loader:
-        if x.dim() == 6:  # Multi-clip averaging: (B, K, T, 1, S, S)
-            B, K = x.shape[:2]
-            emb = net.embed(x.flatten(0, 1).to(device)).float()
-            emb = F.normalize(emb, p=2, dim=1).view(B, K, -1).mean(dim=1).cpu()
-        else:
-            emb = net.embed(x.to(device)).float().cpu()
+        with torch.amp.autocast("cuda", enabled=use_amp):
+            if x.dim() == 6:  # Multi-clip averaging: (B, K, T, 1, S, S)
+                B, K = x.shape[:2]
+                xf = to_float_input(x.flatten(0, 1), device)
+                emb = net.embed(xf).float()
+                emb = F.normalize(emb, p=2, dim=1).view(B, K, -1).mean(dim=1).cpu()
+            else:
+                xf = to_float_input(x, device)
+                emb = net.embed(xf).float().cpu()
         out.append(emb)
     return torch.cat(out).numpy()
 
